@@ -1,0 +1,17 @@
+[project]
+name = "ohca-pipeline"
+version = "0.1.0"
+description = "OHCA temperature trajectory analysis pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=0.9.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "pyarrow>=14.0.0",
+    "pytz>=2024.1",
+    "marimo>=0.13.0",
+]
+
+[dependency-groups]
+dev = []

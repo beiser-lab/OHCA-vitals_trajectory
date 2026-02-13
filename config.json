@@ -1,0 +1,7 @@
+{
+    "data_directory": "G:/Medicine/Pulmonary/Research/Bhavani Lab/CLIF-Data/Post-EPIC/Version-1/",
+    "output_directory": "output_dir",
+    "timezone": "US/Eastern",
+    "file_format": "parquet",
+    "site_name": "Emory"
+}
