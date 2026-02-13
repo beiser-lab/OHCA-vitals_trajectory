@@ -689,6 +689,8 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
         rename_map[f"n_{vital}"] = f"n_{vital}"
     hourly_wide = hourly_wide.rename(columns=rename_map)
     hourly_wide = hourly_wide.sort_values(["trajectory","survival_status","hour"]).reset_index(drop=True)
+    hourly_wide.insert(0, "site", config["site_name"])
+    hourly_wide.insert(1, "window_hours", WH)
 
     log.info(f"  Final: {len(hourly_wide):,} rows, cols={list(hourly_wide.columns)}")
 
@@ -950,7 +952,6 @@ def step11_table1(config, con, log, traj_assignment):
 # TABLE 1 OUTPUTS (text, poolable CSV, summary CSV)
 # =============================================================
 def save_table1_outputs(config, log, table1):
-    print(config)
     WH = config["window_hours"]
     site = config["site_name"]
 
