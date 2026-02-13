@@ -1,6 +1,6 @@
 """
-pipeline_steps.py — All pipeline step functions.
-Import and call from notebook.
+All pipeline step functions.
+
 """
 import pandas as pd
 import numpy as np
@@ -17,7 +17,7 @@ from pipeline_helpers import (
 
 
 # =============================================================
-# STEP 2: BUILD COHORT
+#  BUILD COHORT
 # =============================================================
 def step2_build_cohort(config, con, log):
     """Build full cardiac arrest cohort from hospital_diagnosis. Window-independent."""
@@ -78,7 +78,7 @@ def step2_build_cohort(config, con, log):
 
 
 # =============================================================
-# STEP 3: FILTER OHCA → FIRST ENCOUNTER → ICU
+# FILTER OHCA → FIRST ENCOUNTER → ICU
 # =============================================================
 def step3_filter_ohca_icu(config, con, log, cohort_v2):
     """Filter to OHCA, first encounter, ICU-admitted. Window-independent."""
@@ -213,12 +213,172 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     cohort_ohca_icu.to_parquet(config["intermediate_dir"] / "cohort_ohca_icu.parquet", index=False)
     con.register("ohca_icu_df", cohort_ohca_icu)
     log.info(f"  [OK] Saved cohort_ohca_icu")
+
+    # --- Cohort flow / funnel diagram ---
+    _plot_cohort_funnel(config, log, cohort_v2, ohca_all, cohort_ohca_first, cohort_ohca_icu)
+
     log.info("=" * 60)
     return cohort_ohca_icu
 
 
 # =============================================================
-# STEP 4a: RAW VITALS + TEMPERATURE
+# FUNNEL DIAGRAMS
+# =============================================================
+def _plot_cohort_funnel(config, log, cohort_v2, ohca_all, cohort_ohca_first, cohort_ohca_icu):
+    """CONSORT-style cohort flow diagram. Saved to upload_dir (window-independent)."""
+    n_all = cohort_v2["hospitalization_id"].nunique()
+    n_ohca = ohca_all["hospitalization_id"].nunique()
+    n_first = cohort_ohca_first["hospitalization_id"].nunique()
+    n_icu = cohort_ohca_icu["hospitalization_id"].nunique()
+    n_surv = cohort_ohca_icu[cohort_ohca_icu["survival_status"] == "Survivor"]["hospitalization_id"].nunique()
+    n_died = cohort_ohca_icu[cohort_ohca_icu["survival_status"] == "Non-Survivor"]["hospitalization_id"].nunique()
+
+    stages = [
+        f"All Cardiac Arrest\n(ICD I46.x / I49.0x)\nn = {n_all:,}",
+        f"OHCA\n(POA = 1)\nn = {n_ohca:,}",
+        f"First Encounter\nper Patient\nn = {n_first:,}",
+        f"ICU Admitted\nn = {n_icu:,}",
+    ]
+    drops = [
+        f"Excluded: IHCA / Unknown\nn = {n_all - n_ohca:,}",
+        f"Excluded: Repeat encounters\nn = {n_ohca - n_first:,}",
+        f"Excluded: No ICU\nn = {n_first - n_icu:,}",
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 10))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, len(stages) * 2.5 + 1)
+    ax.axis("off")
+
+    box_w, box_h = 4.5, 1.4
+    box_x = 2.75
+    drop_x = 7.8
+    y_start = len(stages) * 2.5 - 1
+
+    for i, label in enumerate(stages):
+        y = y_start - i * 2.5
+        # Main box
+        rect = plt.Rectangle((box_x, y), box_w, box_h, linewidth=1.5,
+                              edgecolor="#333333", facecolor="#E3F2FD", zorder=2)
+        ax.add_patch(rect)
+        ax.text(box_x + box_w / 2, y + box_h / 2, label,
+                ha="center", va="center", fontsize=10, fontweight="bold", zorder=3)
+
+        # Arrow down
+        if i < len(stages) - 1:
+            ax.annotate("", xy=(box_x + box_w / 2, y - 0.05),
+                        xytext=(box_x + box_w / 2, y - 1.05),
+                        arrowprops=dict(arrowstyle="<-", color="#333", lw=1.5))
+
+        # Drop box
+        if i < len(drops):
+            drop_y = y - 0.55
+            rect_d = plt.Rectangle((drop_x - 1.5, drop_y), 3.2, 0.9, linewidth=1,
+                                   edgecolor="#999", facecolor="#FFEBEE", zorder=2)
+            ax.add_patch(rect_d)
+            ax.text(drop_x + 0.1, drop_y + 0.45, drops[i],
+                    ha="center", va="center", fontsize=8, color="#C62828", zorder=3)
+            # Arrow to drop box
+            ax.annotate("", xy=(drop_x - 1.5, drop_y + 0.45),
+                        xytext=(box_x + box_w, y + box_h / 2 - 0.55),
+                        arrowprops=dict(arrowstyle="->", color="#999", lw=1, ls="--"))
+
+    # Final split: Survivor / Non-Survivor
+    y_final = y_start - (len(stages) - 1) * 2.5
+    y_split = y_final - 1.8
+    for j, (label, n, color) in enumerate([
+        (f"Survivor\nn = {n_surv:,}", n_surv, "#E8F5E9"),
+        (f"Non-Survivor\nn = {n_died:,}", n_died, "#FFEBEE"),
+    ]):
+        sx = box_x + j * 2.5 - 0.1
+        rect_s = plt.Rectangle((sx, y_split), 2.3, 1.0, linewidth=1.5,
+                                edgecolor="#333", facecolor=color, zorder=2)
+        ax.add_patch(rect_s)
+        ax.text(sx + 1.15, y_split + 0.5, label,
+                ha="center", va="center", fontsize=9, fontweight="bold", zorder=3)
+        ax.annotate("", xy=(sx + 1.15, y_split + 1.0),
+                    xytext=(box_x + box_w / 2, y_final),
+                    arrowprops=dict(arrowstyle="->", color="#333", lw=1.5))
+
+    fig.suptitle("Cohort Selection Flow Diagram", fontsize=14, fontweight="bold", y=0.98)
+    fig.tight_layout()
+    fig.savefig(config["upload_dir"] / "cohort_flow_diagram.png", dpi=150, bbox_inches="tight")
+    log.info(f"  [OK] cohort_flow_diagram.png")
+    plt.close()
+
+
+def _plot_trajectory_funnel(config, log, n0, n1, n2, n_after, n_traj, traj_assignment):
+    """Temperature trajectory attrition funnel. Saved to upload_dir."""
+    WH = config["window_hours"]
+
+    stages = [
+        ("OHCA ICU Cohort", n0),
+        ("Has temp (32–44°C)", n1),
+        (f"Within 0–{WH}h window", n2),
+        ("After hourly dedup", n_after),
+        ("Trajectory assigned", n_traj),
+    ]
+
+    # Trajectory breakdown for final bar
+    traj_counts = {}
+    for tn in ["Hypothermic", "Normothermic", "Rapid Decline", "Persistent High"]:
+        traj_counts[tn] = len(traj_assignment[traj_assignment["trajectory"] == tn])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8), gridspec_kw={"width_ratios": [2, 1]})
+
+    # --- Left: Funnel bars ---
+    labels = [s[0] for s in stages]
+    values = [s[1] for s in stages]
+    drops = [values[i] - values[i + 1] for i in range(len(values) - 1)]
+
+    colors = ["#1565C0", "#1976D2", "#1E88E5", "#42A5F5", "#64B5F6"]
+    y_pos = list(range(len(stages) - 1, -1, -1))
+
+    bars = ax1.barh(y_pos, values, color=colors, edgecolor="white", height=0.7)
+    for i, (bar, val) in enumerate(zip(bars, values)):
+        ax1.text(bar.get_width() + max(values) * 0.01, y_pos[i],
+                 f"n = {val:,}", va="center", fontsize=11, fontweight="bold")
+        if i > 0:
+            drop = values[i - 1] - val
+            pct = drop / values[i - 1] * 100
+            ax1.text(max(values) * 0.5, y_pos[i] + 0.35,
+                     f"↓ lost {drop:,} ({pct:.1f}%)",
+                     va="center", ha="center", fontsize=8, color="#C62828", style="italic")
+
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(labels, fontsize=11)
+    ax1.set_xlabel("Number of Encounters", fontsize=11)
+    ax1.set_title(f"Cohort Attrition — Temperature Trajectory ({WH}h)", fontsize=13, fontweight="bold")
+    ax1.grid(True, alpha=0.3, axis="x")
+    ax1.set_xlim(0, max(values) * 1.25)
+
+    # --- Right: Trajectory breakdown ---
+    from pipeline_helpers import TRAJ_COLORS, TRAJ_ORDER
+    traj_names = [t for t in TRAJ_ORDER if t in traj_counts]
+    traj_vals = [traj_counts[t] for t in traj_names]
+    traj_clrs = [TRAJ_COLORS[t] for t in traj_names]
+
+    bars2 = ax2.barh(range(len(traj_names)), traj_vals, color=traj_clrs, edgecolor="white", height=0.6)
+    for bar, val in zip(bars2, traj_vals):
+        pct = val / n_traj * 100
+        ax2.text(bar.get_width() + max(traj_vals) * 0.02, bar.get_y() + bar.get_height() / 2,
+                 f"{val:,} ({pct:.1f}%)", va="center", fontsize=10)
+
+    ax2.set_yticks(range(len(traj_names)))
+    ax2.set_yticklabels(traj_names, fontsize=11)
+    ax2.set_xlabel("Number of Encounters", fontsize=11)
+    ax2.set_title("Trajectory Distribution", fontsize=13, fontweight="bold")
+    ax2.grid(True, alpha=0.3, axis="x")
+    ax2.set_xlim(0, max(traj_vals) * 1.35)
+
+    fig.tight_layout()
+    fig.savefig(config["upload_dir"] / f"trajectory_attrition_funnel_{WH}h.png", dpi=150, bbox_inches="tight")
+    log.info(f"  [OK] trajectory_attrition_funnel_{WH}h.png")
+    plt.close()
+
+
+# =============================================================
+# RAW VITALS + TEMPERATURE
 # =============================================================
 def step4a_extract_vitals(config, con, log):
     """Extract raw vitals and temperature for the window. Window-dependent."""
@@ -409,7 +569,7 @@ def step4b_block_vitals(config, con, log):
 
 
 # =============================================================
-# STEP 5: PLOTS — BLOCKED + HOURLY
+# PLOTS — BLOCKED + HOURLY
 # =============================================================
 def step5_vitals_plots(config, log, block_vitals, raw_vitals):
     """Generate blocked and hourly vital sign plots. Window-dependent."""
@@ -517,13 +677,13 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
 
 
 # =============================================================
-# STEP 6: SAVE FOR R
+# SAVE FILES
 # =============================================================
 def step6_save_for_r(config, log, cohort_ohca_icu, raw_vitals, raw_temp, block_vitals):
     WH = config["window_hours"]
     BS = config["block_size"]
     log.info("\n" + "=" * 60)
-    log.info(f"  STEP 6: SAVE FOR R ({WH}h)")
+    log.info(f"  STEP 6: SAVE FILES ({WH}h)")
     log.info("=" * 60)
     cohort_ohca_icu.to_parquet(config["intermediate_dir"] / "cohort_ohca_icu.parquet", index=False)
     log.info(f"  [OK] cohort_ohca_icu.parquet — {cohort_ohca_icu['hospitalization_id'].nunique():,} enc")
@@ -537,7 +697,7 @@ def step6_save_for_r(config, log, cohort_ohca_icu, raw_vitals, raw_temp, block_v
 
 
 # =============================================================
-# STEP 7: TRAJECTORY ASSIGNMENT
+# TRAJECTORY ASSIGNMENT
 # =============================================================
 def step7_trajectory_assignment(config, log, cohort_ohca_icu, raw_temp):
     WH = config["window_hours"]
@@ -620,12 +780,16 @@ def step7_trajectory_assignment(config, log, cohort_ohca_icu, raw_temp):
 
     traj_assignment.to_csv(config["intermediate_dir"] / f"ohca_icu_traj_assignment_{WH}h.csv", index=False)
     log.info(f"  [OK] Saved traj_assignment_{WH}h")
+
+    # --- Trajectory attrition funnel ---
+    _plot_trajectory_funnel(config, log, n0, n1, n2, n_after, n_traj, traj_assignment)
+
     log.info("=" * 60)
     return traj_assignment, vitals_temp
 
 
 # =============================================================
-# STEP 7b: HOURLY VITALS TABLE BY TRAJECTORY × SURVIVAL
+# HOURLY VITALS TABLE BY TRAJECTORY × SURVIVAL
 # =============================================================
 def step7b_hourly_vitals_table(config, con, log, traj_assignment):
     WH = config["window_hours"]
@@ -702,7 +866,7 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
 
 
 # =============================================================
-# STEP 8: TRAJECTORY PLOTS
+# TRAJECTORY PLOTS
 # =============================================================
 def step8_trajectory_plots(config, log, vitals_temp, traj_assignment):
     WH = config["window_hours"]
@@ -763,7 +927,7 @@ def step8_trajectory_plots(config, log, vitals_temp, traj_assignment):
 
 
 # =============================================================
-# STEP 9: TRAJECTORY × SURVIVAL PLOTS + MORTALITY BAR
+# TRAJECTORY × SURVIVAL PLOTS + MORTALITY BAR
 # =============================================================
 def step9_traj_survival_plots(config, log, vitals_by_traj, cohort_ohca_icu, traj_assignment):
     WH = config["window_hours"]
@@ -844,7 +1008,7 @@ def step9_traj_survival_plots(config, log, vitals_by_traj, cohort_ohca_icu, traj
 
 
 # =============================================================
-# STEP 10: COHORT COMPARISON
+# COHORT COMPARISON
 # =============================================================
 def step10_cohort_comparison(config, log, cohort_ohca_icu, cohort_v2):
     WH = config["window_hours"]
@@ -879,7 +1043,7 @@ def step10_cohort_comparison(config, log, cohort_ohca_icu, cohort_v2):
 
 
 # =============================================================
-# STEP 11: TABLE 1
+# TABLE 1
 # =============================================================
 def step11_table1(config, con, log, traj_assignment):
     WH = config["window_hours"]

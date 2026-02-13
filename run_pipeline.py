@@ -70,12 +70,6 @@ def _(Logger, duckdb, make_config):
 
 
 @app.cell
-def _(config_init):
-    config_init
-    return
-
-
-@app.cell
 def _(con, config_init, log_init, step2_build_cohort):
     cohort_v2 = step2_build_cohort(config_init, con, log_init)
     return (cohort_v2,)
