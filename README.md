@@ -1,5 +1,7 @@
 # OHCA Vitals Trajectory Pipeline
-Vitals trajectories in out-of-hospital cardiac arrest (OHCA) patients admitted to the ICU. 
+
+Vitals trajectories in out-of-hospital cardiac arrest (OHCA) patients admitted to the ICU.
+
 ## File Structure
 
 ```
@@ -71,3 +73,14 @@ Results are saved to `Upload_to_Box_without_oral_{24,72}/`:
 - Table 1 summary (`.txt`, `.csv`)
 - Pipeline log (`.txt`)
 
+## Upload to Box
+
+After the pipeline completes, upload both output folders to the shared Box folder:
+
+1. Navigate to the shared Box folder: **OHCA Vitals Trajectory → Site Results**
+2. Create a folder with your site name (e.g., `Emory/`)
+3. Upload the two output folders into it:
+   - `Upload_to_Box_without_oral_24/`
+   - `Upload_to_Box_without_oral_72/`
+
+> **Note:** Do NOT upload the `intermediate_without_oral_{24,72}/` folders — those contain raw patient-level data and are for local use only.
