@@ -1,6 +1,6 @@
 """
-All pipeline step functions.
-
+pipeline_steps.py — All pipeline step functions.
+Import and call from notebook.
 """
 import pandas as pd
 import numpy as np
@@ -17,7 +17,7 @@ from pipeline_helpers import (
 
 
 # =============================================================
-#  BUILD COHORT
+# STEP 2: BUILD COHORT
 # =============================================================
 def step2_build_cohort(config, con, log):
     """Build full cardiac arrest cohort from hospital_diagnosis. Window-independent."""
@@ -33,10 +33,11 @@ def step2_build_cohort(config, con, log):
         SELECT DISTINCT
             h.patient_id, d.hospitalization_id, d.diagnosis_code,
             d.diagnosis_primary, d.poa_present,
-            CASE WHEN d.poa_present = 1 THEN 'OHCA'
-                 WHEN d.poa_present = 0 THEN 'IHCA' ELSE 'Unknown' END AS arrest_type,
+            CASE WHEN CAST(d.poa_present AS VARCHAR) IN ('1','true','yes','y','Y','True','TRUE','Yes','YES') THEN 'OHCA'
+                 WHEN CAST(d.poa_present AS VARCHAR) IN ('0','false','no','n','N','False','FALSE','No','NO') THEN 'IHCA'
+                 ELSE 'Unknown' END AS arrest_type,
             hc.discharge_category,
-            CASE WHEN hc.discharge_category = 'Expired' THEN 'Non-Survivor'
+            CASE WHEN LOWER(hc.discharge_category) = 'expired' THEN 'Non-Survivor'
                  ELSE 'Survivor' END AS survival_status
         FROM {hosp_dx_table} d
         INNER JOIN {hosp_table} hc ON d.hospitalization_id = hc.hospitalization_id
@@ -45,6 +46,10 @@ def step2_build_cohort(config, con, log):
         WHERE {icd_filter}
     """).fetchdf()
     cohort_v2["icd_description"] = cohort_v2["diagnosis_code"].apply(map_description)
+
+    # Normalize case for cross-site consistency
+    if "discharge_category" in cohort_v2.columns:
+        cohort_v2["discharge_category"] = cohort_v2["discharge_category"].str.strip().str.title()
 
     enc_per_pt = cohort_v2.groupby("patient_id")["hospitalization_id"].nunique()
     log.info(f"\n  FULL COHORT: {cohort_v2['patient_id'].nunique():,} patients, "
@@ -78,7 +83,7 @@ def step2_build_cohort(config, con, log):
 
 
 # =============================================================
-# FILTER OHCA → FIRST ENCOUNTER → ICU
+# STEP 3: FILTER OHCA → FIRST ENCOUNTER → ICU
 # =============================================================
 def step3_filter_ohca_icu(config, con, log, cohort_v2):
     """Filter to OHCA, first encounter, ICU-admitted. Window-independent."""
@@ -112,10 +117,10 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     admission_paths = con.execute(f"""
         WITH patient_locations AS (
             SELECT a.hospitalization_id,
-                MAX(CASE WHEN a.location_category='ed' THEN 1 ELSE 0 END) AS has_ed,
-                MAX(CASE WHEN a.location_category='icu' THEN 1 ELSE 0 END) AS has_icu,
-                MAX(CASE WHEN a.location_category='ward' THEN 1 ELSE 0 END) AS has_ward,
-                MAX(CASE WHEN a.location_category='stepdown' THEN 1 ELSE 0 END) AS has_stepdown
+                MAX(CASE WHEN LOWER(a.location_category)='ed' THEN 1 ELSE 0 END) AS has_ed,
+                MAX(CASE WHEN LOWER(a.location_category)='icu' THEN 1 ELSE 0 END) AS has_icu,
+                MAX(CASE WHEN LOWER(a.location_category)='ward' THEN 1 ELSE 0 END) AS has_ward,
+                MAX(CASE WHEN LOWER(a.location_category)='stepdown' THEN 1 ELSE 0 END) AS has_stepdown
             FROM {adt_table} a
             WHERE a.hospitalization_id IN (SELECT hospitalization_id FROM ohca_first_df)
             GROUP BY a.hospitalization_id
@@ -137,10 +142,10 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     mort_by_path = con.execute(f"""
         WITH patient_locations AS (
             SELECT a.hospitalization_id,
-                MAX(CASE WHEN a.location_category='icu' THEN 1 ELSE 0 END) AS has_icu,
-                MAX(CASE WHEN a.location_category='ward' THEN 1 ELSE 0 END) AS has_ward,
-                MAX(CASE WHEN a.location_category='ed' THEN 1 ELSE 0 END) AS has_ed,
-                MAX(CASE WHEN a.location_category='stepdown' THEN 1 ELSE 0 END) AS has_stepdown
+                MAX(CASE WHEN LOWER(a.location_category)='icu' THEN 1 ELSE 0 END) AS has_icu,
+                MAX(CASE WHEN LOWER(a.location_category)='ward' THEN 1 ELSE 0 END) AS has_ward,
+                MAX(CASE WHEN LOWER(a.location_category)='ed' THEN 1 ELSE 0 END) AS has_ed,
+                MAX(CASE WHEN LOWER(a.location_category)='stepdown' THEN 1 ELSE 0 END) AS has_stepdown
             FROM {adt_table} a
             WHERE a.hospitalization_id IN (SELECT hospitalization_id FROM ohca_first_df)
             GROUP BY a.hospitalization_id
@@ -170,7 +175,7 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     # Filter to ICU
     icu_ids = con.execute(f"""
         SELECT DISTINCT hospitalization_id FROM {adt_table}
-        WHERE location_category='icu'
+        WHERE LOWER(location_category)='icu'
             AND hospitalization_id IN (SELECT hospitalization_id FROM ohca_first_df)
     """).fetchdf()
 
@@ -194,7 +199,7 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
         SELECT a.location_type, COUNT(DISTINCT a.hospitalization_id) AS encounters
         FROM {adt_table} a
         WHERE a.hospitalization_id IN (SELECT hospitalization_id FROM ohca_first_df)
-            AND a.location_category='icu'
+            AND LOWER(a.location_category)='icu'
         GROUP BY a.location_type ORDER BY encounters DESC
     """).fetchdf()
     log.info(f"\n  ICU type breakdown:")
@@ -378,7 +383,7 @@ def _plot_trajectory_funnel(config, log, n0, n1, n2, n_after, n_traj, traj_assig
 
 
 # =============================================================
-# RAW VITALS + TEMPERATURE
+# STEP 4a: RAW VITALS + TEMPERATURE
 # =============================================================
 def step4a_extract_vitals(config, con, log):
     """Extract raw vitals and temperature for the window. Window-dependent."""
@@ -569,7 +574,7 @@ def step4b_block_vitals(config, con, log):
 
 
 # =============================================================
-# PLOTS — BLOCKED + HOURLY
+# STEP 5: PLOTS — BLOCKED + HOURLY
 # =============================================================
 def step5_vitals_plots(config, log, block_vitals, raw_vitals):
     """Generate blocked and hourly vital sign plots. Window-dependent."""
@@ -677,13 +682,13 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
 
 
 # =============================================================
-# SAVE FILES
+# STEP 6: SAVE FOR R
 # =============================================================
 def step6_save_for_r(config, log, cohort_ohca_icu, raw_vitals, raw_temp, block_vitals):
     WH = config["window_hours"]
     BS = config["block_size"]
     log.info("\n" + "=" * 60)
-    log.info(f"  STEP 6: SAVE FILES ({WH}h)")
+    log.info(f"  STEP 6: SAVE FOR R ({WH}h)")
     log.info("=" * 60)
     cohort_ohca_icu.to_parquet(config["intermediate_dir"] / "cohort_ohca_icu.parquet", index=False)
     log.info(f"  [OK] cohort_ohca_icu.parquet — {cohort_ohca_icu['hospitalization_id'].nunique():,} enc")
@@ -697,7 +702,7 @@ def step6_save_for_r(config, log, cohort_ohca_icu, raw_vitals, raw_temp, block_v
 
 
 # =============================================================
-# TRAJECTORY ASSIGNMENT
+# STEP 7: TRAJECTORY ASSIGNMENT
 # =============================================================
 def step7_trajectory_assignment(config, log, cohort_ohca_icu, raw_temp):
     WH = config["window_hours"]
@@ -789,7 +794,7 @@ def step7_trajectory_assignment(config, log, cohort_ohca_icu, raw_temp):
 
 
 # =============================================================
-# HOURLY VITALS TABLE BY TRAJECTORY × SURVIVAL
+# STEP 7b: HOURLY VITALS TABLE BY TRAJECTORY × SURVIVAL
 # =============================================================
 def step7b_hourly_vitals_table(config, con, log, traj_assignment):
     WH = config["window_hours"]
@@ -866,7 +871,7 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
 
 
 # =============================================================
-# TRAJECTORY PLOTS
+# STEP 8: TRAJECTORY PLOTS
 # =============================================================
 def step8_trajectory_plots(config, log, vitals_temp, traj_assignment):
     WH = config["window_hours"]
@@ -927,7 +932,7 @@ def step8_trajectory_plots(config, log, vitals_temp, traj_assignment):
 
 
 # =============================================================
-# TRAJECTORY × SURVIVAL PLOTS + MORTALITY BAR
+# STEP 9: TRAJECTORY × SURVIVAL PLOTS + MORTALITY BAR
 # =============================================================
 def step9_traj_survival_plots(config, log, vitals_by_traj, cohort_ohca_icu, traj_assignment):
     WH = config["window_hours"]
@@ -1008,7 +1013,7 @@ def step9_traj_survival_plots(config, log, vitals_by_traj, cohort_ohca_icu, traj
 
 
 # =============================================================
-# COHORT COMPARISON
+# STEP 10: COHORT COMPARISON
 # =============================================================
 def step10_cohort_comparison(config, log, cohort_ohca_icu, cohort_v2):
     WH = config["window_hours"]
@@ -1043,7 +1048,7 @@ def step10_cohort_comparison(config, log, cohort_ohca_icu, cohort_v2):
 
 
 # =============================================================
-# TABLE 1
+# STEP 11: TABLE 1
 # =============================================================
 def step11_table1(config, con, log, traj_assignment):
     WH = config["window_hours"]
@@ -1065,7 +1070,7 @@ def step11_table1(config, con, log, traj_assignment):
             SELECT a.hospitalization_id,
                 ROUND(SUM(EXTRACT(EPOCH FROM (a.out_dttm-a.in_dttm)))/3600/24, 1) AS icu_los_days
             FROM {adt_table} a WHERE a.hospitalization_id IN (SELECT hospitalization_id FROM ohca_icu_df)
-                AND a.location_category='icu' GROUP BY a.hospitalization_id
+                AND LOWER(a.location_category)='icu' GROUP BY a.hospitalization_id
         )
         SELECT c.hospitalization_id, c.patient_id, c.survival_status, c.arrest_type,
             p.race_category, p.ethnicity_category, p.sex_category,
@@ -1079,6 +1084,12 @@ def step11_table1(config, con, log, traj_assignment):
 
     table1 = table1.merge(traj_assignment[["hospitalization_id","trajectory"]], on="hospitalization_id", how="left")
     table1["trajectory"] = table1["trajectory"].fillna("No temp data")
+
+    # Normalize case for cross-site consistency
+    table1["sex_category"] = table1["sex_category"].str.strip().str.title()
+    table1["race_category"] = table1["race_category"].str.strip().str.title()
+    table1["ethnicity_category"] = table1["ethnicity_category"].str.strip().str.title()
+    table1["discharge_category"] = table1.get("discharge_category", pd.Series(dtype=str)).str.strip().str.title()
 
     log.info(f"  Rows: {len(table1):,}, Encounters: {table1['hospitalization_id'].nunique():,}")
 
