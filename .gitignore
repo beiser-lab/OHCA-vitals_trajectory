@@ -205,7 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-/output_dir/intermediate_without_oral_24
-/output_dir/intermediate_without_oral_72
-/Upload_to_Box_without_oral_24
-/Upload_to_Box_without_oral_72
+
+# Local outputs / generated artifacts
+.DS_Store
+/output_dir/
+/Upload_to_Box_without_oral_*/
+/Upload_to_Box_without_oral_glucose_*/
+/Upload_to_Box_without_oral_lactate_*/

@@ -1,0 +1,163 @@
+diff --git a/README.md b/README.md
+index e8d9a4c..cc9d841 100644
+--- a/README.md
++++ b/README.md
+@@ -39,7 +39,7 @@ uv sync
+     "data_directory": "path/to/your/clif/data",
+     "output_directory": "path/to/output",
+     "file_format": "parquet",
+-    "site_name": "YourSite",
++    "site_name": "auto",
+     "timezone": "US/Eastern"
+ }
+ ```
+@@ -49,7 +49,7 @@ uv sync
+ | `data_directory` | Path to folder containing CLIF tables (`clif_hospitalization.parquet`, `clif_vitals.parquet`, etc.) |
+ | `output_directory` | Path for intermediate output files |
+ | `file_format` | `parquet` or `csv` |
+-| `site_name` | Your site name (e.g., `Emory`, `UCSF`) — used in poolable Table 1 |
++| `site_name` | Optional site label override for poolable outputs. Use `"auto"` (recommended) to infer from `clif_adt.hospital_id`. |
+ | `timezone` | Timezone for timestamps (default: `US/Eastern`) |
+ 
+ ## Run the pipeline
+diff --git a/config.json b/config.json
+index a6b4dbc..b2e4d9e 100644
+--- a/config.json
++++ b/config.json
+@@ -1,7 +1,7 @@
+ {
+-    "data_directory": "G:/Medicine/Pulmonary/Research/Bhavani Lab/CLIF-Data/Post-EPIC/Version-1/",
++    "data_directory": "/Users/davidbeiser/Library/CloudStorage/Box-Box/RCLIF_data/CLIF_2018_24/2.1.0",
+     "output_directory": "output_dir",
+     "timezone": "US/Eastern",
+     "file_format": "parquet",
+-    "site_name": "Emory"
+-}
+\ No newline at end of file
++    "site_name": "auto"
++}
+diff --git a/pipeline_helpers.py b/pipeline_helpers.py
+index 35939d8..4a53c7e 100644
+--- a/pipeline_helpers.py
++++ b/pipeline_helpers.py
+@@ -6,6 +6,7 @@ import pandas as pd
+ import numpy as np
+ from pathlib import Path
+ from datetime import datetime
++import duckdb
+ import warnings
+ warnings.filterwarnings("ignore")
+ 
+@@ -68,14 +69,22 @@ def make_config(config_path="config.json", window_hours=72):
+     """Build config dict for a given window."""
+     with open(config_path, "r") as f:
+         raw = json.load(f)
++    data_dir = Path(raw["data_directory"])
++    file_format = raw.get("file_format", "parquet")
++    site_name, site_source = resolve_site_name(
++        data_dir=data_dir,
++        file_format=file_format,
++        configured_site_name=raw.get("site_name"),
++    )
+     config = {
+-        "data_dir": Path(raw["data_directory"]),
++        "data_dir": data_dir,
+         "output_dir": Path(raw["output_directory"]),
+         "intermediate_dir": Path(raw["output_directory"]) / f"intermediate_without_oral_{window_hours}",
+         "upload_dir": Path(f"Upload_to_Box_without_oral_{window_hours}"),
+         "timezone": raw.get("timezone", "US/Eastern"),
+-        "file_format": raw.get("file_format", "parquet"),
+-        "site_name": raw.get("site_name", "Unknown"),
++        "file_format": file_format,
++        "site_name": site_name,
++        "site_name_source": site_source,
+         "window_hours": window_hours,
+         "block_size": BLOCK_SIZE,
+         "n_blocks": window_hours // BLOCK_SIZE,
+@@ -99,6 +108,52 @@ def read_table(config, table_name):
+         raise ValueError(f"Unknown format: {ext}")
+ 
+ 
++def resolve_site_name(data_dir, file_format, configured_site_name=None):
++    """
++    Resolve site identifier for poolable outputs.
++    Priority:
++      1) Explicit config site_name when not empty/auto.
++      2) Auto-detect from clif_adt.hospital_id.
++      3) Fallback to Unknown.
++    """
++    explicit = (str(configured_site_name).strip() if configured_site_name is not None else "")
++    if explicit and explicit.lower() not in {"auto", "from_data"}:
++        return explicit, "config.site_name"
++
++    try:
++        ext = file_format
++        adt_path = Path(data_dir) / f"clif_adt.{ext}"
++        if not adt_path.exists():
++            return "Unknown", "fallback.no_clif_adt"
++
++        if ext == "parquet":
++            qry = f"""
++                SELECT DISTINCT CAST(hospital_id AS VARCHAR) AS hospital_id
++                FROM read_parquet('{adt_path}')
++                WHERE hospital_id IS NOT NULL
++                ORDER BY 1
++            """
++        elif ext == "csv":
++            qry = f"""
++                SELECT DISTINCT CAST(hospital_id AS VARCHAR) AS hospital_id
++                FROM read_csv_auto('{adt_path}')
++                WHERE hospital_id IS NOT NULL
++                ORDER BY 1
++            """
++        else:
++            return "Unknown", f"fallback.unknown_format.{ext}"
++
++        ids = duckdb.sql(qry).fetchdf()["hospital_id"].dropna().astype(str).tolist()
++        ids = [v.strip() for v in ids if v.strip()]
++        if len(ids) == 1:
++            return ids[0], "clif_adt.hospital_id"
++        if len(ids) > 1:
++            return "MULTISITE", "clif_adt.hospital_id.multiple"
++        return "Unknown", "fallback.empty_hospital_id"
++    except Exception:
++        return "Unknown", "fallback.exception"
++
++
+ def build_icd_filter(column="diagnosis_code"):
+     conditions = " OR ".join(f"{column} LIKE '{code}%'" for code in ICD_PREFIXES)
+     return f"({conditions})"
+@@ -127,4 +182,4 @@ def block_plot_params(config):
+ def hourly_plot_params(config):
+     wh = config["window_hours"]
+     step = 2 if wh <= 24 else 4
+-    return (0, wh), range(0, wh + 1, step)
+\ No newline at end of file
++    return (0, wh), range(0, wh + 1, step)
+diff --git a/pipeline_steps.py b/pipeline_steps.py
+index d5802bb..0a10086 100644
+--- a/pipeline_steps.py
++++ b/pipeline_steps.py
+@@ -858,6 +858,7 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
+         rename_map[f"n_{vital}"] = f"n_{vital}"
+     hourly_wide = hourly_wide.rename(columns=rename_map)
+     hourly_wide = hourly_wide.sort_values(["trajectory","survival_status","hour"]).reset_index(drop=True)
++    log.info(f"  Site label: {config['site_name']} (source: {config.get('site_name_source', 'unknown')})")
+     hourly_wide.insert(0, "site", config["site_name"])
+     hourly_wide.insert(1, "window_hours", WH)
+ 
+@@ -1129,6 +1130,7 @@ def step11_table1(config, con, log, traj_assignment):
+ def save_table1_outputs(config, log, table1):
+     WH = config["window_hours"]
+     site = config["site_name"]
++    log.info(f"  Site label: {site} (source: {config.get('site_name_source', 'unknown')})")
+ 
+     n_surv = len(table1[table1["survival_status"]=="Survivor"])
+     n_nonsurv = len(table1[table1["survival_status"]=="Non-Survivor"])
+@@ -1265,4 +1267,4 @@ def save_table1_outputs(config, log, table1):
+         srows.append({"Group":traj, "Variable":"ICU LOS, median (IQR)", "Value":f"{sub['icu_los_days'].median():.1f} ({sub['icu_los_days'].quantile(0.25):.1f}-{sub['icu_los_days'].quantile(0.75):.1f})"})
+         srows.append({"Group":traj, "Variable":"Mortality, n (%)", "Value":f"{mort:,} ({mort/n*100:.1f}%)"})
+     pd.DataFrame(srows).to_csv(config["upload_dir"] / f"table1_summary_{WH}h.csv", index=False)
+-    log.info(f"  [OK] table1_summary_{WH}h.csv")
+\ No newline at end of file
++    log.info(f"  [OK] table1_summary_{WH}h.csv")
