@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-import duckdb
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -23,13 +22,8 @@ ICD_DESCRIPTIONS = {
     "I49.00": "Ventricular fibrillation",
     "I49.01": "Ventricular flutter",
 }
-CLIF_VITAL_SIGNS = ["heart_rate", "temp_c", "spo2", "map"]
-BLOOD_GLUCOSE_LAB_CATEGORIES = ["glucose_fingerstick", "glucose_serum", "glucose_mixed_venous"]
-BLOOD_LACTATE_LAB_CATEGORIES = ["lactate"]
-VITAL_SIGNS = [*CLIF_VITAL_SIGNS]
+VITAL_SIGNS = ["heart_rate", "temp_c", "spo2", "map"]
 BLOCK_SIZE = 4
-GLUCOSE_EPOCH_HOURS = 6
-LACTATE_EPOCH_HOURS = 6
 
 TRAJ_COLORS = {
     "Hypothermic": "#1565C0", "Normothermic": "#43A047",
@@ -37,12 +31,6 @@ TRAJ_COLORS = {
 }
 SURV_COLORS = {"Survivor": "#2196F3", "Non-Survivor": "#E53935"}
 TRAJ_ORDER = ["Persistent High", "Rapid Decline", "Normothermic", "Hypothermic"]
-GLUCOSE_TRAJ_LETTERS = {
-    "Persistent High": "A",
-    "Rapid Decline": "B",
-    "Normothermic": "C",
-    "Hypothermic": "D",
-}
 
 VITALS_INFO = {
     "mean_heart_rate": {"title": "Heart Rate (bpm)", "ylabel": "Heart Rate (bpm)"},
@@ -80,34 +68,20 @@ def make_config(config_path="config.json", window_hours=72):
     """Build config dict for a given window."""
     with open(config_path, "r") as f:
         raw = json.load(f)
-    data_dir = Path(raw["data_directory"])
-    file_format = raw.get("file_format", "parquet")
-    site_name, site_source = resolve_site_name(
-        data_dir=data_dir,
-        file_format=file_format,
-        configured_site_name=raw.get("site_name"),
-    )
     config = {
-        "data_dir": data_dir,
+        "data_dir": Path(raw["data_directory"]),
         "output_dir": Path(raw["output_directory"]),
         "intermediate_dir": Path(raw["output_directory"]) / f"intermediate_without_oral_{window_hours}",
         "upload_dir": Path(f"Upload_to_Box_without_oral_{window_hours}"),
-        "glucose_upload_dir": Path(f"Upload_to_Box_without_oral_glucose_{window_hours}"),
-        "lactate_upload_dir": Path(f"Upload_to_Box_without_oral_lactate_{window_hours}"),
         "timezone": raw.get("timezone", "US/Eastern"),
-        "file_format": file_format,
-        "site_name": site_name,
-        "site_name_source": site_source,
+        "file_format": raw.get("file_format", "parquet"),
+        "site_name": raw.get("site_name", "Unknown"),
         "window_hours": window_hours,
         "block_size": BLOCK_SIZE,
         "n_blocks": window_hours // BLOCK_SIZE,
-        "glucose_epoch_hours": GLUCOSE_EPOCH_HOURS,
-        "lactate_epoch_hours": LACTATE_EPOCH_HOURS,
     }
     config["intermediate_dir"].mkdir(parents=True, exist_ok=True)
     config["upload_dir"].mkdir(parents=True, exist_ok=True)
-    config["glucose_upload_dir"].mkdir(parents=True, exist_ok=True)
-    config["lactate_upload_dir"].mkdir(parents=True, exist_ok=True)
     return config
 
 
@@ -125,81 +99,32 @@ def read_table(config, table_name):
         raise ValueError(f"Unknown format: {ext}")
 
 
-def resolve_site_name(data_dir, file_format, configured_site_name=None):
-    """
-    Resolve site identifier for poolable outputs.
-    Priority:
-      1) Explicit config site_name when not empty/auto.
-      2) Auto-detect from clif_adt.hospital_id.
-      3) Fallback to Unknown.
-    """
-    explicit = (str(configured_site_name).strip() if configured_site_name is not None else "")
-    if explicit and explicit.lower() not in {"auto", "from_data"}:
-        return explicit, "config.site_name"
-
-    try:
-        ext = file_format
-        adt_path = Path(data_dir) / f"clif_adt.{ext}"
-        if not adt_path.exists():
-            return "Unknown", "fallback.no_clif_adt"
-
-        if ext == "parquet":
-            qry = f"""
-                SELECT DISTINCT CAST(hospital_id AS VARCHAR) AS hospital_id
-                FROM read_parquet('{adt_path}')
-                WHERE hospital_id IS NOT NULL
-                ORDER BY 1
-            """
-        elif ext == "csv":
-            qry = f"""
-                SELECT DISTINCT CAST(hospital_id AS VARCHAR) AS hospital_id
-                FROM read_csv_auto('{adt_path}')
-                WHERE hospital_id IS NOT NULL
-                ORDER BY 1
-            """
-        else:
-            return "Unknown", f"fallback.unknown_format.{ext}"
-
-        ids = duckdb.sql(qry).fetchdf()["hospital_id"].dropna().astype(str).tolist()
-        ids = [v.strip() for v in ids if v.strip()]
-        if len(ids) == 1:
-            return ids[0], "clif_adt.hospital_id"
-        if len(ids) > 1:
-            return "MULTISITE", "clif_adt.hospital_id.multiple"
-        return "Unknown", "fallback.empty_hospital_id"
-    except Exception:
-        return "Unknown", "fallback.exception"
-
-
 def build_icd_filter(column="diagnosis_code"):
-    # Match dotted and undotted ICD formats by normalizing away periods.
-    normalized_column = f"REPLACE(UPPER(CAST({column} AS VARCHAR)), '.', '')"
-    conditions = " OR ".join(
-        f"{normalized_column} LIKE '{code.replace('.', '')}%'"
-        for code in ICD_PREFIXES
-    )
-    return f"({conditions})"
+    """Build SQL filter for cardiac arrest ICD codes. Handles with/without dots, any case."""
+    conditions = []
+    for code in ICD_PREFIXES:
+        code_upper = code.upper()
+        code_nodot = code_upper.replace(".", "")
+        # Match "I46.2%" and "I462%" etc.
+        conditions.append(f"UPPER({column}) LIKE '{code_upper}%'")
+        conditions.append(f"UPPER(REPLACE({column}, '.', '')) LIKE '{code_nodot}%'")
+    return f"({' OR '.join(conditions)})"
 
 
 def map_description(code):
-    code_str = str(code)
-    norm_code = code_str.replace(".", "").upper()
+    code_str = str(code).upper()
+    code_nodot = code_str.replace(".", "")
     for prefix, desc in ICD_DESCRIPTIONS.items():
-        if norm_code.startswith(prefix.replace(".", "").upper()):
+        prefix_upper = prefix.upper()
+        prefix_nodot = prefix_upper.replace(".", "")
+        if code_str.startswith(prefix_upper) or code_nodot.startswith(prefix_nodot):
             return desc
     return "Unknown"
 
 
 def vitals_filter_sql():
-    return ", ".join(f"'{v}'" for v in CLIF_VITAL_SIGNS)
-
-
-def glucose_labs_filter_sql():
-    return ", ".join(f"'{v}'" for v in BLOOD_GLUCOSE_LAB_CATEGORIES)
-
-
-def lactate_labs_filter_sql():
-    return ", ".join(f"'{v}'" for v in BLOOD_LACTATE_LAB_CATEGORIES)
+    """Returns SQL fragment for vital_category filter, case-insensitive via LOWER()."""
+    return ", ".join(f"'{v}'" for v in VITAL_SIGNS)
 
 
 def block_plot_params(config):
@@ -217,9 +142,13 @@ def hourly_plot_params(config):
     return (0, wh), range(0, wh + 1, step)
 
 
-def glucose_traj_letter(trajectory_name):
-    return GLUCOSE_TRAJ_LETTERS.get(trajectory_name, "U")
+# Column values that should be normalized to Title Case after any query
+_TITLE_CASE_COLS = ["sex_category", "race_category", "ethnicity_category", "discharge_category"]
 
-
-def glucose_traj_label(trajectory_name):
-    return f"Category {glucose_traj_letter(trajectory_name)}"
+def normalize_categories(df):
+    """Normalize known categorical columns to Title Case for cross-site consistency."""
+    for col in _TITLE_CASE_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().str.title()
+            df.loc[df[col].isin(["Nan", "None", ""]), col] = None
+    return df

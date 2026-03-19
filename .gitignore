@@ -212,3 +212,6 @@ __marimo__/
 /Upload_to_Box_without_oral_*/
 /Upload_to_Box_without_oral_glucose_*/
 /Upload_to_Box_without_oral_lactate_*/
+
+# Local site configuration copies
+config.local.json

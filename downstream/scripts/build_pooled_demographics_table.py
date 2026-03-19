@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         choices=[24, 72],
         help="Window (hours) to pool.",
     )
+    parser.add_argument(
+        "--eicu-dir",
+        type=Path,
+        default=None,
+        help="Optional path to eICU CLIF export (expects clif_ohca_icu_cohort.parquet etc.).",
+    )
     return parser.parse_args()
 
 
@@ -91,11 +97,16 @@ def fmt_count_pct(count: float, denom: float) -> str:
     return f"{int(round(count)):,} ({(count / denom * 100):.1f}%)"
 
 
-def pooled_mean_sd(rows: pd.DataFrame, mean_var: str, sd_var: str) -> tuple[float, float, int]:
+def pooled_mean_sd(rows: pd.DataFrame, mean_var: str, sd_var: str, n_var: str | None = None) -> tuple[float, float, int]:
     m = rows.loc[rows["variable"] == mean_var, ["site", "value", "n"]].rename(columns={"value": "mean", "n": "n_mean"})
     s = rows.loc[rows["variable"] == sd_var, ["site", "value", "n"]].rename(columns={"value": "sd", "n": "n_sd"})
     z = m.merge(s, on="site", how="inner")
     z["n"] = pd.to_numeric(z["n_mean"], errors="coerce")
+    if n_var:
+        n_override = rows.loc[rows["variable"] == n_var, ["site", "value"]].rename(columns={"value": "n_override"})
+        z = z.merge(n_override, on="site", how="left")
+        z["n_override"] = pd.to_numeric(z["n_override"], errors="coerce")
+        z["n"] = np.where(z["n_override"].notna() & (z["n_override"] >= 0), z["n_override"], z["n"])
     z["mean"] = pd.to_numeric(z["mean"], errors="coerce")
     z["sd"] = pd.to_numeric(z["sd"], errors="coerce")
     z = z[(z["n"] > 0) & z["mean"].notna()]
@@ -117,7 +128,58 @@ def pooled_mean_sd(rows: pd.DataFrame, mean_var: str, sd_var: str) -> tuple[floa
     return pooled_mean, pooled_sd, int(round(n_total))
 
 
-def load_table(base_dir: Path, window_hours: int) -> pd.DataFrame:
+def slugify_category(value: object) -> str:
+    return str(value).strip().lower().replace(" ", "_").replace("/", "_")
+
+
+def build_eicu_poolable_rows(eicu_dir: Path, window_hours: int) -> pd.DataFrame:
+    cohort_path = eicu_dir / "clif_ohca_icu_cohort.parquet"
+    patient_path = eicu_dir / "clif_patient.parquet"
+    hosp_path = eicu_dir / "clif_hospitalization.parquet"
+    needed = [cohort_path, patient_path, hosp_path]
+    missing = [str(p) for p in needed if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing eICU input files: {', '.join(missing)}")
+
+    cohort = pd.read_parquet(cohort_path)[["patient_id", "hospitalization_id", "survival_status"]]
+    patient = pd.read_parquet(patient_path)[["patient_id", "sex_category", "race_category", "ethnicity_category"]]
+    hosp = pd.read_parquet(hosp_path)[["hospitalization_id", "age_at_admission"]]
+    dat = cohort.merge(patient, on="patient_id", how="left").merge(hosp, on="hospitalization_id", how="left")
+
+    groups = [
+        ("Overall", dat),
+        ("Survivor", dat[dat["survival_status"] == "Survivor"]),
+        ("Non-Survivor", dat[dat["survival_status"] == "Non-Survivor"]),
+    ]
+
+    rows: list[dict[str, object]] = []
+    for gname, gdf in groups:
+        n_total = int(len(gdf))
+        base = {"site": "eicu", "window_hours": int(window_hours), "group_type": "survival", "group": gname, "n": n_total}
+        rows.append({**base, "variable": "n", "value": float(n_total)})
+
+        age = pd.to_numeric(gdf["age_at_admission"], errors="coerce")
+        age_non = age.dropna()
+        if len(age_non) > 0:
+            rows.append({**base, "variable": "age_mean", "value": float(age_non.mean())})
+            rows.append({**base, "variable": "age_sd", "value": float(age_non.std())})
+            rows.append({**base, "variable": "age_n", "value": float(len(age_non))})
+
+        for prefix, col in [("sex", "sex_category"), ("race", "race_category"), ("ethnicity", "ethnicity_category")]:
+            s = gdf[col]
+            for cat in sorted(s.dropna().astype(str).str.strip().unique().tolist()):
+                if not cat:
+                    continue
+                slug = slugify_category(cat)
+                count = int((s.astype(str).str.strip() == cat).sum())
+                rows.append({**base, "variable": f"{prefix}_{slug}_n", "value": float(count)})
+
+    out = pd.DataFrame(rows)
+    out["source_path"] = str(eicu_dir)
+    return out
+
+
+def load_table(base_dir: Path, window_hours: int, eicu_dir: Path | None = None) -> pd.DataFrame:
     pattern = f"*/Upload_to_Box_without_oral_{window_hours}/table1_poolable_{window_hours}h.csv"
     paths = sorted(base_dir.glob(pattern))
     if not paths:
@@ -136,6 +198,9 @@ def load_table(base_dir: Path, window_hours: int) -> pd.DataFrame:
     out["window_hours"] = pd.to_numeric(out["window_hours"], errors="coerce")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     out["n"] = pd.to_numeric(out["n"], errors="coerce")
+    if eicu_dir is not None:
+        eicu_rows = build_eicu_poolable_rows(eicu_dir=eicu_dir, window_hours=window_hours)
+        out = pd.concat([out, eicu_rows], ignore_index=True)
     return out
 
 
@@ -163,13 +228,23 @@ def build_table(df: pd.DataFrame, window_hours: int) -> tuple[pd.DataFrame, pd.D
     overall_age_by_site = overall.loc[overall["variable"] == "age_mean", ["site", "value"]].rename(columns={"value": "age_mean"})
     overall_age_cov = overall_n_by_site.merge(overall_age_by_site, on="site", how="left")
     overall_age_cov["has_age"] = overall_age_cov["age_mean"].notna()
-    overall_n_total = float(overall_n_by_site["n"].sum())
-    overall_age_n = float(overall_age_cov.loc[overall_age_cov["has_age"], "n"].sum())
+    overall_age_n_by_site = overall.loc[overall["variable"] == "age_n", ["site", "value"]].rename(columns={"value": "age_n"})
+    overall_age_cov = overall_age_cov.merge(overall_age_n_by_site, on="site", how="left")
+    overall_age_cov["n"] = pd.to_numeric(overall_age_cov["n"], errors="coerce")
+    overall_age_cov["age_n"] = pd.to_numeric(overall_age_cov["age_n"], errors="coerce")
+    overall_age_cov["age_n_effective"] = np.where(
+        overall_age_cov["age_n"].notna() & (overall_age_cov["age_n"] >= 0),
+        overall_age_cov["age_n"],
+        np.where(overall_age_cov["has_age"], overall_age_cov["n"], 0.0),
+    )
+    overall_n_total = float(overall_age_cov["n"].sum())
+    overall_age_n = float(overall_age_cov["age_n_effective"].sum())
     overall_age_missing_n = max(overall_n_total - overall_age_n, 0.0)
     overall_age_missing_pct = (overall_age_missing_n / overall_n_total * 100.0) if overall_n_total > 0 else float("nan")
     missing_site_bits = []
-    for _, r in overall_age_cov.loc[~overall_age_cov["has_age"]].sort_values("site").iterrows():
-        missing_site_bits.append(f"{r['site']} (n={int(round(float(r['n']))):,})")
+    overall_age_cov["site_missing_n"] = (overall_age_cov["n"] - overall_age_cov["age_n_effective"]).clip(lower=0)
+    for _, r in overall_age_cov.loc[overall_age_cov["site_missing_n"] > 0.5].sort_values("site").iterrows():
+        missing_site_bits.append(f"{r['site']} (n={int(round(float(r['site_missing_n']))):,})")
     if overall_age_missing_n > 0.5:
         site_txt = "; ".join(missing_site_bits) if missing_site_bits else "site-level source files"
         age_note = (
@@ -196,7 +271,7 @@ def build_table(df: pd.DataFrame, window_hours: int) -> tuple[pd.DataFrame, pd.D
         display[g]["N"] = f"{int(round(n_total)):,}"
         long_rows.append({"group": g, "section": "overall", "characteristic": "N", "count": n_total, "denom": n_total, "pct": 100.0})
 
-        age_mean, age_sd, age_n = pooled_mean_sd(gs, "age_mean", "age_sd")
+        age_mean, age_sd, age_n = pooled_mean_sd(gs, "age_mean", "age_sd", n_var="age_n")
         if age_n > 0 and np.isfinite(age_mean):
             sd_str = f"{age_sd:.2f}" if np.isfinite(age_sd) else "NA"
             display[g]["Age, mean ± SD"] = f"{age_mean:.2f} ± {sd_str}"
@@ -279,7 +354,7 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_table(args.base_dir, args.window_hours)
+    df = load_table(args.base_dir, args.window_hours, eicu_dir=args.eicu_dir)
     table, long_df, age_note = build_table(df, args.window_hours)
 
     csv_path = args.output_dir / f"table_demographics_pooled_{args.window_hours}h.csv"

@@ -9,9 +9,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pipeline_helpers import (
-    read_table, build_icd_filter, map_description, vitals_filter_sql, glucose_labs_filter_sql, lactate_labs_filter_sql,
-    block_plot_params, hourly_plot_params,
-    VITAL_SIGNS, TRAJ_COLORS, SURV_COLORS, TRAJ_ORDER, GLUCOSE_TRAJ_LETTERS, glucose_traj_letter, glucose_traj_label,
+    read_table, build_icd_filter, map_description, vitals_filter_sql,
+    block_plot_params, hourly_plot_params, normalize_categories,
+    VITAL_SIGNS, TRAJ_COLORS, SURV_COLORS, TRAJ_ORDER,
     VITALS_INFO, VITALS_HOURLY_INFO,
 )
 
@@ -33,8 +33,8 @@ def step2_build_cohort(config, con, log):
         SELECT DISTINCT
             h.patient_id, d.hospitalization_id, d.diagnosis_code,
             d.diagnosis_primary, d.poa_present,
-            CASE WHEN CAST(d.poa_present AS VARCHAR) IN ('1','true','yes','y','Y','True','TRUE','Yes','YES') THEN 'OHCA'
-                 WHEN CAST(d.poa_present AS VARCHAR) IN ('0','false','no','n','N','False','FALSE','No','NO') THEN 'IHCA'
+            CASE WHEN d.poa_present = 1 OR CAST(d.poa_present AS VARCHAR) IN ('true','yes','y','Y','True','TRUE','Yes','YES') THEN 'OHCA'
+                 WHEN d.poa_present = 0 OR CAST(d.poa_present AS VARCHAR) IN ('false','no','n','N','False','FALSE','No','NO') THEN 'IHCA'
                  ELSE 'Unknown' END AS arrest_type,
             hc.discharge_category,
             CASE WHEN LOWER(hc.discharge_category) = 'expired' THEN 'Non-Survivor'
@@ -48,8 +48,7 @@ def step2_build_cohort(config, con, log):
     cohort_v2["icd_description"] = cohort_v2["diagnosis_code"].apply(map_description)
 
     # Normalize case for cross-site consistency
-    if "discharge_category" in cohort_v2.columns:
-        cohort_v2["discharge_category"] = cohort_v2["discharge_category"].str.strip().str.title()
+    normalize_categories(cohort_v2)
 
     enc_per_pt = cohort_v2.groupby("patient_id")["hospitalization_id"].nunique()
     log.info(f"\n  FULL COHORT: {cohort_v2['patient_id'].nunique():,} patients, "
@@ -66,10 +65,7 @@ def step2_build_cohort(config, con, log):
         sub = cohort_v2[cohort_v2["arrest_type"] == atype]
         t = sub["hospitalization_id"].nunique()
         d = sub[sub["survival_status"] == "Non-Survivor"]["hospitalization_id"].nunique()
-        if t > 0:
-            log.info(f"  {atype} mortality: {d/t*100:.1f}% ({d:,}/{t:,})")
-        else:
-            log.info(f"  {atype} mortality: n/a (0/0)")
+        log.info(f"  {atype} mortality: {d/t*100 if t else 0:.1f}% ({d:,}/{t:,})")
 
     log.info(f"\n  ICD code breakdown:")
     icd_counts = cohort_v2.groupby(["diagnosis_code", "icd_description"])["hospitalization_id"].nunique().reset_index()
@@ -98,12 +94,6 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     adt_table = read_table(config, "clif_adt")
 
     ohca_all = cohort_v2[cohort_v2["arrest_type"] == "OHCA"].copy()
-    if ohca_all.empty:
-        unknown_all = cohort_v2[cohort_v2["arrest_type"] == "Unknown"].copy()
-        if not unknown_all.empty:
-            log.info("\n  [WARN] No OHCA rows found from poa_present; using Unknown arrest_type cohort as fallback.")
-            unknown_all["arrest_type"] = "OHCA"
-            ohca_all = unknown_all
     log.info(f"\n  3a. OHCA: {ohca_all['patient_id'].nunique():,} patients, {ohca_all['hospitalization_id'].nunique():,} encounters")
 
     con.register("ohca_all_df", ohca_all)
@@ -201,7 +191,7 @@ def step3_filter_ohca_icu(config, con, log, cohort_v2):
     s = cohort_ohca_icu[cohort_ohca_icu["survival_status"] == "Survivor"]["patient_id"].nunique()
     ns = cohort_ohca_icu[cohort_ohca_icu["survival_status"] == "Non-Survivor"]["patient_id"].nunique()
     total = cohort_ohca_icu["patient_id"].nunique()
-    log.info(f"\n  FINAL OHCA COHORT: Survivor={s:,}, Non-Survivor={ns:,}, Mortality={ns/total*100:.1f}%")
+    log.info(f"\n  FINAL OHCA COHORT: Survivor={s:,}, Non-Survivor={ns:,}, Mortality={ns/total*100 if total else 0:.1f}%")
 
     # ICU type breakdown
     icu_types = con.execute(f"""
@@ -403,6 +393,12 @@ def step4a_extract_vitals(config, con, log):
 
     vitals_table = read_table(config, "clif_vitals")
     vf = vitals_filter_sql()
+
+    # Check if meas_site_name column exists
+    vitals_cols = [col[0] for col in con.execute(f"SELECT * FROM {vitals_table} LIMIT 0").description]
+    has_meas_site = "meas_site_name" in vitals_cols
+    meas_site_col = "v.meas_site_name" if has_meas_site else "NULL AS meas_site_name"
+
     # --- All vitals ---
     raw_vitals = con.execute(f"""
         WITH first_vital AS (
@@ -423,7 +419,7 @@ def step4a_extract_vitals(config, con, log):
             v.vital_category, CAST(v.vital_value AS DOUBLE) AS vital_value,
             v.recorded_dttm, c.time_zero,
             ROUND(EXTRACT(EPOCH FROM (v.recorded_dttm - c.time_zero))/3600, 2) AS hours_from_first_vital,
-            v.meas_site_name
+            {meas_site_col}
         FROM cohort c
         INNER JOIN {vitals_table} v ON c.hospitalization_id=v.hospitalization_id
         WHERE v.vital_category IN ({vf})
@@ -472,7 +468,7 @@ def step4a_extract_vitals(config, con, log):
             v.recorded_dttm, c.time_zero_temp, c.time_zero_vital,
             ROUND(EXTRACT(EPOCH FROM (v.recorded_dttm - c.time_zero_temp))/3600, 2) AS hours_from_first_temp,
             ROUND(EXTRACT(EPOCH FROM (v.recorded_dttm - c.time_zero_vital))/3600, 2) AS hours_from_first_vital,
-            v.meas_site_name
+            {meas_site_col}
         FROM cohort c
         INNER JOIN {vitals_table} v ON c.hospitalization_id=v.hospitalization_id
         WHERE v.vital_category='temp_c'
@@ -483,11 +479,14 @@ def step4a_extract_vitals(config, con, log):
     """).fetchdf()
 
     log.info(f"  Temp: {len(raw_temp):,} rows, {raw_temp['hospitalization_id'].nunique():,} encounters")
-    log.info(f"\n  Temperature by site:")
-    log.info(f"  {'Site':<20s} {'Enc':>12s} {'Meas':>14s}")
-    log.info(f"  {'-'*20} {'-'*12} {'-'*14}")
-    for site, grp in raw_temp.groupby("meas_site_name"):
-        log.info(f"  {str(site):<20s} {grp['hospitalization_id'].nunique():>12,} {len(grp):>14,}")
+    if has_meas_site and raw_temp["meas_site_name"].notna().any():
+        log.info(f"\n  Temperature by site:")
+        log.info(f"  {'Site':<20s} {'Enc':>12s} {'Meas':>14s}")
+        log.info(f"  {'-'*20} {'-'*12} {'-'*14}")
+        for site, grp in raw_temp.groupby("meas_site_name"):
+            log.info(f"  {str(site):<20s} {grp['hospitalization_id'].nunique():>12,} {len(grp):>14,}")
+    else:
+        log.info(f"  (meas_site_name not available — skipping site breakdown)")
     for status in ["Survivor", "Non-Survivor"]:
         sub = raw_temp[raw_temp["survival_status"] == status]
         log.info(f"    {status:15s}: {sub['hospitalization_id'].nunique():>6,} enc, {len(sub):>10,} meas")
@@ -582,197 +581,6 @@ def step4b_block_vitals(config, con, log):
 
 
 # =============================================================
-# STEP 4c: RAW BLOOD GLUCOSE (LABS)
-# =============================================================
-def step4c_extract_glucose(config, con, log):
-    """Extract raw blood glucose labs aligned to first vital. Window-dependent."""
-    WH = config["window_hours"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 4c: RAW BLOOD GLUCOSE (0-{WH}h)")
-    log.info("=" * 60)
-
-    out_cols = [
-        "patient_id",
-        "hospitalization_id",
-        "survival_status",
-        "arrest_type",
-        "vital_category",
-        "vital_value",
-        "recorded_dttm",
-        "time_zero",
-        "hours_from_first_vital",
-        "glucose_source",
-        "reference_unit",
-    ]
-    labs_path = config["data_dir"] / f"clif_labs.{config['file_format']}"
-    if not labs_path.exists():
-        log.info("  [WARN] clif_labs table not found; glucose analysis skipped.")
-        raw_glucose = pd.DataFrame(columns=out_cols)
-        raw_glucose.to_parquet(config["intermediate_dir"] / f"raw_glucose_ohca_icu_{WH}h.parquet", index=False)
-        log.info(f"  [OK] Saved empty raw_glucose_{WH}h")
-        log.info("=" * 60)
-        return raw_glucose
-
-    vitals_table = read_table(config, "clif_vitals")
-    labs_table = read_table(config, "clif_labs")
-    vf = vitals_filter_sql()
-    glucose_filter = glucose_labs_filter_sql()
-    glucose_ts_expr = "COALESCE(l.lab_result_dttm, l.lab_collect_dttm, l.lab_order_dttm)"
-
-    raw_glucose = con.execute(f"""
-        WITH first_vital AS (
-            SELECT v.hospitalization_id, MIN(v.recorded_dttm) AS first_vital_dttm
-            FROM {vitals_table} v
-            WHERE v.hospitalization_id IN (SELECT hospitalization_id FROM ohca_icu_df)
-                AND v.vital_category IN ({vf})
-            GROUP BY v.hospitalization_id
-        ),
-        cohort AS (
-            SELECT DISTINCT c.patient_id, c.hospitalization_id, c.survival_status, c.arrest_type,
-                fv.first_vital_dttm AS time_zero
-            FROM ohca_icu_df c
-            INNER JOIN first_vital fv ON c.hospitalization_id=fv.hospitalization_id
-            WHERE fv.first_vital_dttm IS NOT NULL
-        )
-        SELECT c.patient_id, c.hospitalization_id, c.survival_status, c.arrest_type,
-            'blood_glucose' AS vital_category, CAST(l.lab_value_numeric AS DOUBLE) AS vital_value,
-            {glucose_ts_expr} AS recorded_dttm, c.time_zero,
-            ROUND(EXTRACT(EPOCH FROM ({glucose_ts_expr} - c.time_zero))/3600, 2) AS hours_from_first_vital,
-            CAST(l.lab_category AS VARCHAR) AS glucose_source,
-            CAST(l.reference_unit AS VARCHAR) AS reference_unit
-        FROM cohort c
-        INNER JOIN {labs_table} l ON c.hospitalization_id=l.hospitalization_id
-        WHERE l.lab_category IN ({glucose_filter})
-            AND l.lab_value_numeric IS NOT NULL
-            AND {glucose_ts_expr} IS NOT NULL
-            AND {glucose_ts_expr} >= c.time_zero
-            AND {glucose_ts_expr} < c.time_zero + INTERVAL {WH} HOUR
-        ORDER BY c.hospitalization_id, {glucose_ts_expr}
-    """).fetchdf()
-
-    log.info(f"\n  Glucose labs: {len(raw_glucose):,} rows, {raw_glucose['hospitalization_id'].nunique():,} encounters")
-    log.info(f"  {'Source':<24s} {'Enc':>12s} {'Labs':>14s}")
-    log.info(f"  {'-'*24} {'-'*12} {'-'*14}")
-    for source, grp in raw_glucose.groupby("glucose_source", dropna=False):
-        log.info(f"  {str(source):<24s} {grp['hospitalization_id'].nunique():>12,} {len(grp):>14,}")
-    for status in ["Survivor", "Non-Survivor"]:
-        sub = raw_glucose[raw_glucose["survival_status"] == status]
-        log.info(f"    {status:15s}: {sub['hospitalization_id'].nunique():>6,} enc, {len(sub):>10,} labs")
-
-    raw_glucose.to_parquet(config["intermediate_dir"] / f"raw_glucose_ohca_icu_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved raw_glucose_{WH}h")
-    log.info("=" * 60)
-    return raw_glucose
-
-
-# =============================================================
-# GLUCOSE EPOCH HELPER
-# =============================================================
-def _glucose_epoch_plot_params(window_hours: int, epoch_hours: int):
-    n_epochs = int(np.ceil(window_hours / epoch_hours))
-    tick_pos = [b * epoch_hours + epoch_hours / 2 for b in range(n_epochs)]
-    tick_labels = [f"{b*epoch_hours}-{min((b+1)*epoch_hours, window_hours)}" for b in range(n_epochs)]
-    xlim = (0, window_hours)
-    return n_epochs, tick_pos, tick_labels, xlim
-
-
-# =============================================================
-# STEP 4d: BLOCK BLOOD GLUCOSE
-# =============================================================
-def step4d_block_glucose(config, con, log):
-    """Aggregate blood glucose into N-hour blocks. Window-dependent."""
-    WH = config["window_hours"]
-    BS = int(config.get("glucose_epoch_hours", 6))
-    NB = int(np.ceil(WH / BS))
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 4d: {BS}-HOUR EPOCH BLOOD GLUCOSE (0-{WH}h)")
-    log.info("=" * 60)
-
-    out_cols = [
-        "patient_id",
-        "hospitalization_id",
-        "survival_status",
-        "arrest_type",
-        "poa_present",
-        "block_num",
-        "block_start_hr",
-        "mean_blood_glucose",
-        "n_blood_glucose",
-    ]
-    labs_path = config["data_dir"] / f"clif_labs.{config['file_format']}"
-    if not labs_path.exists():
-        log.info("  [WARN] clif_labs table not found; glucose block analysis skipped.")
-        block_glucose = pd.DataFrame(columns=out_cols)
-        block_glucose.to_csv(config["intermediate_dir"] / f"block_glucose_ohca_icu_{BS}h_{WH}h.csv", index=False)
-        block_glucose.to_parquet(config["intermediate_dir"] / f"block_glucose_ohca_icu_{BS}h_{WH}h.parquet", index=False)
-        log.info(f"  [OK] Saved empty block_glucose_{BS}h_{WH}h")
-        log.info("=" * 60)
-        return block_glucose
-
-    vitals_table = read_table(config, "clif_vitals")
-    labs_table = read_table(config, "clif_labs")
-    vf = vitals_filter_sql()
-    glucose_filter = glucose_labs_filter_sql()
-    glucose_ts_expr = "COALESCE(l.lab_result_dttm, l.lab_collect_dttm, l.lab_order_dttm)"
-
-    block_glucose = con.execute(f"""
-        WITH first_vital AS (
-            SELECT v.hospitalization_id, MIN(v.recorded_dttm) AS first_vital_dttm
-            FROM {vitals_table} v
-            WHERE v.hospitalization_id IN (SELECT hospitalization_id FROM ohca_icu_df)
-                AND v.vital_category IN ({vf})
-            GROUP BY v.hospitalization_id
-        ),
-        cohort AS (
-            SELECT DISTINCT c.patient_id, c.hospitalization_id, c.survival_status,
-                c.arrest_type, c.poa_present, fv.first_vital_dttm AS time_zero
-            FROM ohca_icu_df c
-            INNER JOIN first_vital fv ON c.hospitalization_id=fv.hospitalization_id
-            WHERE fv.first_vital_dttm IS NOT NULL
-        ),
-        blocks AS (SELECT unnest(generate_series(0, {NB - 1})) AS block_num),
-        glucose_binned AS (
-            SELECT c.patient_id, c.hospitalization_id, c.survival_status,
-                c.arrest_type, c.poa_present, b.block_num, b.block_num*{BS} AS block_start_hr,
-                CAST(l.lab_value_numeric AS DOUBLE) AS blood_glucose_value
-            FROM cohort c CROSS JOIN blocks b
-            INNER JOIN {labs_table} l ON c.hospitalization_id=l.hospitalization_id
-                AND {glucose_ts_expr} >= c.time_zero + INTERVAL (b.block_num*{BS}) HOUR
-                AND {glucose_ts_expr} < c.time_zero + INTERVAL ((b.block_num+1)*{BS}) HOUR
-                AND {glucose_ts_expr} < c.time_zero + INTERVAL {WH} HOUR
-            WHERE l.lab_category IN ({glucose_filter})
-                AND l.lab_value_numeric IS NOT NULL
-                AND {glucose_ts_expr} IS NOT NULL
-        )
-        SELECT patient_id, hospitalization_id, survival_status, arrest_type, poa_present,
-            block_num, block_start_hr,
-            AVG(blood_glucose_value) AS mean_blood_glucose,
-            COUNT(*) AS n_blood_glucose
-        FROM glucose_binned
-        GROUP BY patient_id, hospitalization_id, survival_status, arrest_type, poa_present, block_num, block_start_hr
-        ORDER BY survival_status, patient_id, block_num
-    """).fetchdf()
-
-    log.info(f"\n  {NB} blocks of {BS}h (0-{WH}h)")
-    log.info(f"  Patients  : {block_glucose['patient_id'].nunique():,}")
-    log.info(f"  Encounters: {block_glucose['hospitalization_id'].nunique():,}")
-    log.info(f"  Rows      : {len(block_glucose):,}")
-    log.info(f"  {'Block':<8s} {'With Glucose':>14s}")
-    log.info(f"  {'-'*8} {'-'*14}")
-    for b in range(NB):
-        sub = block_glucose[block_glucose["block_num"] == b]
-        log.info(f"  {b*BS}-{(b+1)*BS}h   {(sub['n_blood_glucose']>0).sum():>14,}")
-    if len(block_glucose) > 0:
-        log.info(f"  blood_glucose   : avg {block_glucose['n_blood_glucose'].mean():.1f} labs per {BS}h block")
-
-    block_glucose.to_csv(config["intermediate_dir"] / f"block_glucose_ohca_icu_{BS}h_{WH}h.csv", index=False)
-    block_glucose.to_parquet(config["intermediate_dir"] / f"block_glucose_ohca_icu_{BS}h_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved block_glucose_{BS}h_{WH}h")
-    log.info("=" * 60)
-    return block_glucose
-
-
-# =============================================================
 # STEP 5: PLOTS — BLOCKED + HOURLY
 # =============================================================
 def step5_vitals_plots(config, log, block_vitals, raw_vitals):
@@ -786,17 +594,9 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
     tick_pos, tick_labels, bxlim = block_plot_params(config)
     hxlim, hxticks = hourly_plot_params(config)
 
-    def _make_axes(n_panels, panel_width=6.8, panel_height=4.6):
-        ncols = 2 if n_panels <= 4 else 3
-        ncols = min(max(ncols, 1), max(n_panels, 1))
-        nrows = int(np.ceil(n_panels / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(panel_width * ncols, panel_height * nrows))
-        return fig, np.atleast_1d(axes).flatten()
-
-    # --- Multi-panel block plot ---
-    block_items = list(VITALS_INFO.items())
-    fig, axes = _make_axes(len(block_items))
-    for ax, (col, info) in zip(axes, block_items):
+    # --- 2x2 Block plot ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for ax, (col, info) in zip(axes.flatten(), VITALS_INFO.items()):
         for status, color in SURV_COLORS.items():
             subset = block_vitals[block_vitals["survival_status"] == status]
             grouped = subset.groupby("block_start_hr")[col].agg(["mean","std","count"])
@@ -811,8 +611,6 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
         ax.set_xlim(*bxlim); ax.set_xticks(tick_pos)
         ax.set_xticklabels(tick_labels, fontsize=6, rotation=45, ha="right")
         ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-    for ax in axes[len(block_items):]:
-        ax.axis("off")
     fig.suptitle(f"OHCA (ICU): Survivors vs Non-Survivors [{BS}h blocks, 0-{WH}h]",
                  fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
@@ -841,10 +639,9 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
         fig.savefig(config["upload_dir"] / fname, dpi=150, bbox_inches="tight")
         log.info(f"  [OK] {fname}"); plt.close()
 
-    # --- Multi-panel hourly plot ---
-    hourly_items = list(VITALS_HOURLY_INFO.items())
-    fig, axes = _make_axes(len(hourly_items))
-    for ax, (vital, info) in zip(axes, hourly_items):
+    # --- 2x2 Hourly plot ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for ax, (vital, info) in zip(axes.flatten(), VITALS_HOURLY_INFO.items()):
         vd = raw_vitals[raw_vitals["vital_category"] == vital].copy()
         vd["hour"] = vd["hours_from_first_vital"].round(0).astype(int)
         vd = vd[(vd["hour"] >= 0) & (vd["hour"] <= WH)]
@@ -859,8 +656,6 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
                             grouped["mean"]+1.96*grouped["se"], color=color, alpha=0.15)
         ax.set_xlabel("Hours from First Vital"); ax.set_ylabel(info["ylabel"]); ax.set_title(info["title"])
         ax.set_xlim(*hxlim); ax.set_xticks(hxticks); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-    for ax in axes[len(hourly_items):]:
-        ax.axis("off")
     fig.suptitle(f"OHCA (ICU): Survivors vs Non-Survivors [Hourly, 0-{WH}h]",
                  fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
@@ -890,84 +685,6 @@ def step5_vitals_plots(config, log, block_vitals, raw_vitals):
         fig.savefig(config["upload_dir"] / fname, dpi=150, bbox_inches="tight")
         log.info(f"  [OK] {fname}"); plt.close()
 
-    log.info("=" * 60)
-
-
-# =============================================================
-# STEP 5b: GLUCOSE PLOTS — BLOCKED + HOURLY
-# =============================================================
-def step5b_glucose_plots(config, log, block_glucose, raw_glucose):
-    """Generate blocked and epoch-smoothed blood glucose plots in glucose results folder."""
-    WH = config["window_hours"]
-    BS = int(config.get("glucose_epoch_hours", 6))
-    out_dir = config["glucose_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 5b: GLUCOSE PLOTS (0-{WH}h)")
-    log.info("=" * 60)
-
-    if len(raw_glucose) == 0 or len(block_glucose) == 0:
-        log.info("  [WARN] No glucose rows available; skipping glucose plots.")
-        log.info("=" * 60)
-        return
-
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    # Blocked glucose
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for status, color in SURV_COLORS.items():
-        subset = block_glucose[block_glucose["survival_status"] == status]
-        grouped = subset.groupby("block_start_hr")["mean_blood_glucose"].agg(["mean", "std", "count"])
-        if grouped.empty:
-            continue
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        mid = grouped.index + BS / 2
-        n = subset["hospitalization_id"].nunique()
-        ax.plot(mid, grouped["mean"], color=color, linewidth=2, marker="o", markersize=5, label=f"{status} (n={n:,})")
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.15)
-    ax.set_xlabel("Hours from First Vital")
-    ax.set_ylabel("Blood Glucose (mg/dL)")
-    ax.set_title(f"OHCA (ICU): Blood Glucose [{BS}h epochs, 0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_glucose_blocked_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_glucose_blocked_{WH}h.png")
-    plt.close()
-
-    # Epoch-smoothed glucose (mean per patient per epoch)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    gd = raw_glucose.copy()
-    gd["epoch_start_hr"] = (np.floor(gd["hours_from_first_vital"] / BS) * BS).astype(int)
-    gd = gd[(gd["epoch_start_hr"] >= 0) & (gd["epoch_start_hr"] < WH)]
-    gd = (
-        gd.groupby(["hospitalization_id", "survival_status", "epoch_start_hr"], as_index=False)
-        .agg(epoch_glucose=("vital_value", "mean"))
-    )
-    for status, color in SURV_COLORS.items():
-        sub = gd[gd["survival_status"] == status]
-        grouped = sub.groupby("epoch_start_hr")["epoch_glucose"].agg(["mean", "std", "count"])
-        if grouped.empty:
-            continue
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        n = sub["hospitalization_id"].nunique()
-        mid = grouped.index + BS / 2
-        ax.plot(mid, grouped["mean"], color=color, linewidth=1.8, marker="o", markersize=4, label=f"{status} (n={n:,})")
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.15)
-    ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-    ax.set_ylabel("Blood Glucose (mg/dL)")
-    ax.set_title(f"OHCA (ICU): Blood Glucose — Epoch-Smoothed [0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_glucose_hourly_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_glucose_hourly_{WH}h.png")
-    plt.close()
     log.info("=" * 60)
 
 
@@ -1148,7 +865,6 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
         rename_map[f"n_{vital}"] = f"n_{vital}"
     hourly_wide = hourly_wide.rename(columns=rename_map)
     hourly_wide = hourly_wide.sort_values(["trajectory","survival_status","hour"]).reset_index(drop=True)
-    log.info(f"  Site label: {config['site_name']} (source: {config.get('site_name_source', 'unknown')})")
     hourly_wide.insert(0, "site", config["site_name"])
     hourly_wide.insert(1, "window_hours", WH)
 
@@ -1159,79 +875,6 @@ def step7b_hourly_vitals_table(config, con, log, traj_assignment):
     log.info(f"  [OK] Saved hourly_vitals_{WH}h → upload_dir")
     log.info("=" * 60)
     return hourly_wide
-
-
-# =============================================================
-# STEP 7c: HOURLY GLUCOSE TABLE BY TRAJECTORY × SURVIVAL
-# =============================================================
-def step7c_hourly_glucose_table(config, log, raw_glucose, traj_assignment):
-    WH = config["window_hours"]
-    BS = int(config.get("glucose_epoch_hours", 6))
-    out_dir = config["glucose_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 7c: {BS}-HOUR EPOCH GLUCOSE TABLE (0-{WH}h)")
-    log.info("=" * 60)
-
-    base_cols = [
-        "site",
-        "window_hours",
-        "epoch_hours",
-        "hour",
-        "trajectory",
-        "survival_status",
-        "mean_blood_glucose",
-        "sd_blood_glucose",
-        "se_blood_glucose",
-        "n_blood_glucose",
-    ]
-    if len(raw_glucose) == 0:
-        hourly_glucose = pd.DataFrame(columns=base_cols)
-        hourly_glucose.to_csv(out_dir / f"hourly_glucose_by_trajectory_survival_{WH}h.csv", index=False)
-        hourly_glucose.to_parquet(out_dir / f"hourly_glucose_by_trajectory_survival_{WH}h.parquet", index=False)
-        log.info("  [WARN] No glucose rows available; wrote empty hourly glucose table.")
-        log.info("=" * 60)
-        return hourly_glucose
-
-    rg = raw_glucose.copy()
-    rg["hour"] = (np.floor(rg["hours_from_first_vital"] / BS) * BS).astype(int)
-    rg = rg[(rg["hour"] >= 0) & (rg["hour"] < WH)]
-    rg = (
-        rg.groupby(["hospitalization_id", "hour"], as_index=False)
-        .agg(
-            survival_status=("survival_status", "first"),
-            vital_value=("vital_value", "mean"),
-        )
-    )
-    rg = rg.merge(traj_assignment[["hospitalization_id", "trajectory"]], on="hospitalization_id", how="inner")
-    rg["trajectory"] = rg["trajectory"].fillna("Unassigned")
-    rg["trajectory"] = rg["trajectory"].map(glucose_traj_letter).fillna("U")
-
-    hourly_glucose = (
-        rg.groupby(["hour", "trajectory", "survival_status"], as_index=False)
-        .agg(
-            mean_blood_glucose=("vital_value", "mean"),
-            sd_blood_glucose=("vital_value", "std"),
-            n_blood_glucose=("hospitalization_id", "nunique"),
-        )
-    )
-    hourly_glucose["se_blood_glucose"] = hourly_glucose["sd_blood_glucose"] / np.sqrt(hourly_glucose["n_blood_glucose"])
-    letter_order = [GLUCOSE_TRAJ_LETTERS[t] for t in TRAJ_ORDER] + ["U"]
-    hourly_glucose["trajectory"] = pd.Categorical(hourly_glucose["trajectory"], categories=letter_order, ordered=True)
-    hourly_glucose = hourly_glucose.sort_values(["trajectory", "survival_status", "hour"]).reset_index(drop=True)
-    hourly_glucose["trajectory"] = hourly_glucose["trajectory"].astype(str)
-    hourly_glucose.insert(0, "site", config["site_name"])
-    hourly_glucose.insert(1, "window_hours", WH)
-    hourly_glucose.insert(2, "epoch_hours", BS)
-
-    log.info(f"  Site label: {config['site_name']} (source: {config.get('site_name_source', 'unknown')})")
-    log.info("  Glucose category mapping: A=Persistent High, B=Rapid Decline, C=Normothermic, D=Hypothermic")
-    log.info(f"  Final: {len(hourly_glucose):,} rows, cols={list(hourly_glucose.columns)}")
-
-    hourly_glucose.to_csv(out_dir / f"hourly_glucose_by_trajectory_survival_{WH}h.csv", index=False)
-    hourly_glucose.to_parquet(out_dir / f"hourly_glucose_by_trajectory_survival_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved hourly_glucose_{WH}h → glucose_upload_dir")
-    log.info("=" * 60)
-    return hourly_glucose
 
 
 # =============================================================
@@ -1293,74 +936,6 @@ def step8_trajectory_plots(config, log, vitals_temp, traj_assignment):
     log.info(f"  [OK] ohca_icu_temp_by_trajectory_zscore_{WH}h.png"); plt.close()
     log.info("=" * 60)
     return vitals_by_traj
-
-
-# =============================================================
-# STEP 8b: GLUCOSE BY TRAJECTORY
-# =============================================================
-def step8b_glucose_trajectory_plots(config, log, raw_glucose, traj_assignment):
-    WH = config["window_hours"]
-    BS = int(config.get("glucose_epoch_hours", 6))
-    out_dir = config["glucose_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 8b: GLUCOSE BY TRAJECTORY (0-{WH}h)")
-    log.info("=" * 60)
-
-    if len(raw_glucose) == 0:
-        log.info("  [WARN] No glucose rows available; skipping trajectory glucose plot.")
-        log.info("=" * 60)
-        return pd.DataFrame()
-
-    log.info("  Glucose category mapping: A=Persistent High, B=Rapid Decline, C=Normothermic, D=Hypothermic")
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    glucose_by_traj = raw_glucose.merge(
-        traj_assignment[["hospitalization_id", "trajectory"]], on="hospitalization_id", how="inner"
-    )
-    glucose_by_traj["epoch_start_hr"] = (np.floor(glucose_by_traj["hours_from_first_vital"] / BS) * BS).astype(int)
-    glucose_by_traj = glucose_by_traj[(glucose_by_traj["epoch_start_hr"] >= 0) & (glucose_by_traj["epoch_start_hr"] < WH)]
-    glucose_by_traj = (
-        glucose_by_traj.groupby(
-            ["hospitalization_id", "trajectory", "survival_status", "epoch_start_hr"],
-            as_index=False,
-        )
-        .agg(vital_value=("vital_value", "mean"))
-    )
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for tn in TRAJ_ORDER:
-        color = TRAJ_COLORS[tn]
-        sub = glucose_by_traj[glucose_by_traj["trajectory"] == tn]
-        if len(sub) == 0:
-            continue
-        grouped = sub.groupby("epoch_start_hr")["vital_value"].agg(["mean", "std", "count"])
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        n = sub["hospitalization_id"].nunique()
-        mid = grouped.index + BS / 2
-        ax.plot(
-            mid,
-            grouped["mean"],
-            linewidth=1.7,
-            color=color,
-            marker="o",
-            markersize=4,
-            label=f"{glucose_traj_label(tn)} (n={n:,})",
-        )
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.14)
-    ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-    ax.set_ylabel("Blood Glucose (mg/dL)")
-    ax.set_title(f"OHCA (ICU): Blood Glucose by Category (A-D) [{BS}h epochs, 0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=8, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_glucose_by_trajectory_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_glucose_by_trajectory_{WH}h.png")
-    plt.close()
-    log.info("=" * 60)
-    return glucose_by_traj
 
 
 # =============================================================
@@ -1445,583 +1020,6 @@ def step9_traj_survival_plots(config, log, vitals_by_traj, cohort_ohca_icu, traj
 
 
 # =============================================================
-# STEP 9b: GLUCOSE TRAJECTORY × SURVIVAL PLOTS
-# =============================================================
-def step9b_glucose_traj_survival_plots(config, log, glucose_by_traj, cohort_ohca_icu):
-    WH = config["window_hours"]
-    BS = int(config.get("glucose_epoch_hours", 6))
-    out_dir = config["glucose_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 9b: GLUCOSE TRAJECTORY × SURVIVAL PLOTS (0-{WH}h)")
-    log.info("=" * 60)
-
-    if glucose_by_traj is None or len(glucose_by_traj) == 0:
-        log.info("  [WARN] No glucose-by-trajectory rows available; skipping plots.")
-        log.info("=" * 60)
-        return
-
-    log.info("  Glucose category mapping: A=Persistent High, B=Rapid Decline, C=Normothermic, D=Hypothermic")
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    glucose_traj_surv = glucose_by_traj.copy()
-    if "survival_status" not in glucose_traj_surv.columns:
-        glucose_traj_surv = glucose_traj_surv.merge(
-            cohort_ohca_icu[["hospitalization_id", "survival_status"]].drop_duplicates(),
-            on="hospitalization_id",
-            how="left",
-        )
-    else:
-        surv_lookup = cohort_ohca_icu[["hospitalization_id", "survival_status"]].drop_duplicates()
-        surv_lookup = surv_lookup.set_index("hospitalization_id")["survival_status"]
-        missing = glucose_traj_surv["survival_status"].isna()
-        if missing.any():
-            glucose_traj_surv.loc[missing, "survival_status"] = glucose_traj_surv.loc[missing, "hospitalization_id"].map(surv_lookup)
-    glucose_traj_surv["survival_status"] = glucose_traj_surv["survival_status"].fillna("Unknown")
-
-    # Faceted by trajectory
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    for idx, tn in enumerate(TRAJ_ORDER):
-        ax = axes[idx // 2][idx % 2]
-        for status, color in SURV_COLORS.items():
-            sub = glucose_traj_surv[
-                (glucose_traj_surv["trajectory"] == tn) & (glucose_traj_surv["survival_status"] == status)
-            ]
-            if len(sub) == 0:
-                continue
-            grouped = sub.groupby("epoch_start_hr")["vital_value"].agg(["mean", "std", "count"])
-            grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-            n = sub["hospitalization_id"].nunique()
-            mid = grouped.index + BS / 2
-            ax.plot(mid, grouped["mean"], linewidth=1.6, color=color, marker="o", markersize=4, label=f"{status} (n={n:,})")
-            ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.14)
-        ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-        ax.set_ylabel("Blood Glucose (mg/dL)")
-        ax.set_title(glucose_traj_label(tn))
-        ax.set_xlim(*bxlim)
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    fig.suptitle(f"OHCA (ICU): Glucose by Category (A-D) and Survival [{BS}h epochs, 0-{WH}h]", fontsize=14, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_glucose_traj_survival_facet_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_glucose_traj_survival_facet_{WH}h.png")
-    plt.close()
-
-    # Final-epoch trajectory summary (distinct from step5b overall epoch curves)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    final_epoch_start = (int(np.ceil(WH / BS)) - 1) * BS
-    end = glucose_traj_surv[glucose_traj_surv["epoch_start_hr"] == final_epoch_start].copy()
-    if end.empty and "epoch_start_hr" in glucose_traj_surv.columns:
-        final_epoch_start = int(glucose_traj_surv["epoch_start_hr"].max())
-        end = glucose_traj_surv[glucose_traj_surv["epoch_start_hr"] == final_epoch_start].copy()
-
-    xpos = np.arange(len(TRAJ_ORDER))
-    width = 0.36
-    for i, (status, color) in enumerate(SURV_COLORS.items()):
-        vals = []
-        for tn in TRAJ_ORDER:
-            s = end[(end["trajectory"] == tn) & (end["survival_status"] == status)]["vital_value"]
-            vals.append(float(s.mean()) if len(s) else np.nan)
-        ax.bar(xpos + (i - 0.5) * width, vals, width=width, color=color, alpha=0.9, label=status)
-    ax.set_xlabel("Glucose Category (A-D)")
-    ax.set_ylabel("Blood Glucose (mg/dL)")
-    ax.set_title(
-        f"OHCA (ICU): Blood Glucose at Final {BS}h Epoch ({final_epoch_start}-{min(final_epoch_start+BS, WH)}h)\n"
-        "Survivor vs Non-Survivor by Category"
-    )
-    ax.set_xticks(xpos)
-    ax.set_xticklabels([glucose_traj_letter(t) for t in TRAJ_ORDER], rotation=0)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_glucose_survival_overall_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_glucose_survival_overall_{WH}h.png")
-    plt.close()
-    log.info("=" * 60)
-
-
-# =============================================================
-# STEP 4e: RAW BLOOD LACTATE (LABS)
-# =============================================================
-def step4e_extract_lactate(config, con, log):
-    """Extract raw blood/serum lactate labs aligned to first vital. Window-dependent."""
-    WH = config["window_hours"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 4e: RAW BLOOD LACTATE (0-{WH}h)")
-    log.info("=" * 60)
-
-    out_cols = [
-        "patient_id",
-        "hospitalization_id",
-        "survival_status",
-        "arrest_type",
-        "vital_category",
-        "vital_value",
-        "recorded_dttm",
-        "time_zero",
-        "hours_from_first_vital",
-        "lactate_source",
-        "reference_unit",
-    ]
-    labs_path = config["data_dir"] / f"clif_labs.{config['file_format']}"
-    if not labs_path.exists():
-        log.info("  [WARN] clif_labs table not found; lactate analysis skipped.")
-        raw_lactate = pd.DataFrame(columns=out_cols)
-        raw_lactate.to_parquet(config["intermediate_dir"] / f"raw_lactate_ohca_icu_{WH}h.parquet", index=False)
-        log.info(f"  [OK] Saved empty raw_lactate_{WH}h")
-        log.info("=" * 60)
-        return raw_lactate
-
-    vitals_table = read_table(config, "clif_vitals")
-    labs_table = read_table(config, "clif_labs")
-    vf = vitals_filter_sql()
-    lactate_filter = lactate_labs_filter_sql()
-    lactate_ts_expr = "COALESCE(l.lab_result_dttm, l.lab_collect_dttm, l.lab_order_dttm)"
-
-    raw_lactate = con.execute(f"""
-        WITH first_vital AS (
-            SELECT v.hospitalization_id, MIN(v.recorded_dttm) AS first_vital_dttm
-            FROM {vitals_table} v
-            WHERE v.hospitalization_id IN (SELECT hospitalization_id FROM ohca_icu_df)
-                AND v.vital_category IN ({vf})
-            GROUP BY v.hospitalization_id
-        ),
-        cohort AS (
-            SELECT DISTINCT c.patient_id, c.hospitalization_id, c.survival_status, c.arrest_type,
-                fv.first_vital_dttm AS time_zero
-            FROM ohca_icu_df c
-            INNER JOIN first_vital fv ON c.hospitalization_id=fv.hospitalization_id
-            WHERE fv.first_vital_dttm IS NOT NULL
-        )
-        SELECT c.patient_id, c.hospitalization_id, c.survival_status, c.arrest_type,
-            'blood_lactate' AS vital_category, CAST(l.lab_value_numeric AS DOUBLE) AS vital_value,
-            {lactate_ts_expr} AS recorded_dttm, c.time_zero,
-            ROUND(EXTRACT(EPOCH FROM ({lactate_ts_expr} - c.time_zero))/3600, 2) AS hours_from_first_vital,
-            CAST(COALESCE(l.lab_order_category, l.lab_name, l.lab_order_name, 'unknown') AS VARCHAR) AS lactate_source,
-            CAST(l.reference_unit AS VARCHAR) AS reference_unit
-        FROM cohort c
-        INNER JOIN {labs_table} l ON c.hospitalization_id=l.hospitalization_id
-        WHERE l.lab_category IN ({lactate_filter})
-            AND l.lab_value_numeric IS NOT NULL
-            AND {lactate_ts_expr} IS NOT NULL
-            AND {lactate_ts_expr} >= c.time_zero
-            AND {lactate_ts_expr} < c.time_zero + INTERVAL {WH} HOUR
-        ORDER BY c.hospitalization_id, {lactate_ts_expr}
-    """).fetchdf()
-
-    log.info(f"\n  Lactate labs: {len(raw_lactate):,} rows, {raw_lactate['hospitalization_id'].nunique():,} encounters")
-    log.info(f"  {'Source':<24s} {'Enc':>12s} {'Labs':>14s}")
-    log.info(f"  {'-'*24} {'-'*12} {'-'*14}")
-    for source, grp in raw_lactate.groupby("lactate_source", dropna=False):
-        log.info(f"  {str(source):<24s} {grp['hospitalization_id'].nunique():>12,} {len(grp):>14,}")
-    for status in ["Survivor", "Non-Survivor"]:
-        sub = raw_lactate[raw_lactate["survival_status"] == status]
-        log.info(f"    {status:15s}: {sub['hospitalization_id'].nunique():>6,} enc, {len(sub):>10,} labs")
-
-    raw_lactate.to_parquet(config["intermediate_dir"] / f"raw_lactate_ohca_icu_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved raw_lactate_{WH}h")
-    log.info("=" * 60)
-    return raw_lactate
-
-
-# =============================================================
-# STEP 4f: BLOCK BLOOD LACTATE
-# =============================================================
-def step4f_block_lactate(config, con, log):
-    """Aggregate blood lactate into N-hour epochs. Window-dependent."""
-    WH = config["window_hours"]
-    BS = int(config.get("lactate_epoch_hours", 6))
-    NB = int(np.ceil(WH / BS))
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 4f: {BS}-HOUR EPOCH BLOOD LACTATE (0-{WH}h)")
-    log.info("=" * 60)
-
-    out_cols = [
-        "patient_id",
-        "hospitalization_id",
-        "survival_status",
-        "arrest_type",
-        "poa_present",
-        "block_num",
-        "block_start_hr",
-        "mean_blood_lactate",
-        "n_blood_lactate",
-    ]
-    labs_path = config["data_dir"] / f"clif_labs.{config['file_format']}"
-    if not labs_path.exists():
-        log.info("  [WARN] clif_labs table not found; lactate block analysis skipped.")
-        block_lactate = pd.DataFrame(columns=out_cols)
-        block_lactate.to_csv(config["intermediate_dir"] / f"block_lactate_ohca_icu_{BS}h_{WH}h.csv", index=False)
-        block_lactate.to_parquet(config["intermediate_dir"] / f"block_lactate_ohca_icu_{BS}h_{WH}h.parquet", index=False)
-        log.info(f"  [OK] Saved empty block_lactate_{BS}h_{WH}h")
-        log.info("=" * 60)
-        return block_lactate
-
-    vitals_table = read_table(config, "clif_vitals")
-    labs_table = read_table(config, "clif_labs")
-    vf = vitals_filter_sql()
-    lactate_filter = lactate_labs_filter_sql()
-    lactate_ts_expr = "COALESCE(l.lab_result_dttm, l.lab_collect_dttm, l.lab_order_dttm)"
-
-    block_lactate = con.execute(f"""
-        WITH first_vital AS (
-            SELECT v.hospitalization_id, MIN(v.recorded_dttm) AS first_vital_dttm
-            FROM {vitals_table} v
-            WHERE v.hospitalization_id IN (SELECT hospitalization_id FROM ohca_icu_df)
-                AND v.vital_category IN ({vf})
-            GROUP BY v.hospitalization_id
-        ),
-        cohort AS (
-            SELECT DISTINCT c.patient_id, c.hospitalization_id, c.survival_status,
-                c.arrest_type, c.poa_present, fv.first_vital_dttm AS time_zero
-            FROM ohca_icu_df c
-            INNER JOIN first_vital fv ON c.hospitalization_id=fv.hospitalization_id
-            WHERE fv.first_vital_dttm IS NOT NULL
-        ),
-        blocks AS (SELECT unnest(generate_series(0, {NB - 1})) AS block_num),
-        lactate_binned AS (
-            SELECT c.patient_id, c.hospitalization_id, c.survival_status,
-                c.arrest_type, c.poa_present, b.block_num, b.block_num*{BS} AS block_start_hr,
-                CAST(l.lab_value_numeric AS DOUBLE) AS blood_lactate_value
-            FROM cohort c CROSS JOIN blocks b
-            INNER JOIN {labs_table} l ON c.hospitalization_id=l.hospitalization_id
-                AND {lactate_ts_expr} >= c.time_zero + INTERVAL (b.block_num*{BS}) HOUR
-                AND {lactate_ts_expr} < c.time_zero + INTERVAL ((b.block_num+1)*{BS}) HOUR
-                AND {lactate_ts_expr} < c.time_zero + INTERVAL {WH} HOUR
-            WHERE l.lab_category IN ({lactate_filter})
-                AND l.lab_value_numeric IS NOT NULL
-                AND {lactate_ts_expr} IS NOT NULL
-        )
-        SELECT patient_id, hospitalization_id, survival_status, arrest_type, poa_present,
-            block_num, block_start_hr,
-            AVG(blood_lactate_value) AS mean_blood_lactate,
-            COUNT(*) AS n_blood_lactate
-        FROM lactate_binned
-        GROUP BY patient_id, hospitalization_id, survival_status, arrest_type, poa_present, block_num, block_start_hr
-        ORDER BY survival_status, patient_id, block_num
-    """).fetchdf()
-
-    log.info(f"\n  {NB} blocks of {BS}h (0-{WH}h)")
-    log.info(f"  Patients  : {block_lactate['patient_id'].nunique():,}")
-    log.info(f"  Encounters: {block_lactate['hospitalization_id'].nunique():,}")
-    log.info(f"  Rows      : {len(block_lactate):,}")
-    log.info(f"  {'Block':<8s} {'With Lactate':>14s}")
-    log.info(f"  {'-'*8} {'-'*14}")
-    for b in range(NB):
-        sub = block_lactate[block_lactate["block_num"] == b]
-        log.info(f"  {b*BS}-{(b+1)*BS}h   {(sub['n_blood_lactate']>0).sum():>14,}")
-    if len(block_lactate) > 0:
-        log.info(f"  blood_lactate   : avg {block_lactate['n_blood_lactate'].mean():.1f} labs per {BS}h epoch")
-
-    block_lactate.to_csv(config["intermediate_dir"] / f"block_lactate_ohca_icu_{BS}h_{WH}h.csv", index=False)
-    block_lactate.to_parquet(config["intermediate_dir"] / f"block_lactate_ohca_icu_{BS}h_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved block_lactate_{BS}h_{WH}h")
-    log.info("=" * 60)
-    return block_lactate
-
-
-# =============================================================
-# STEP 5c: LACTATE PLOTS — BLOCKED + EPOCH-SMOOTHED
-# =============================================================
-def step5c_lactate_plots(config, log, block_lactate, raw_lactate):
-    """Generate blocked and epoch-smoothed blood lactate plots in lactate results folder."""
-    WH = config["window_hours"]
-    BS = int(config.get("lactate_epoch_hours", 6))
-    out_dir = config["lactate_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 5c: LACTATE PLOTS (0-{WH}h)")
-    log.info("=" * 60)
-
-    if len(raw_lactate) == 0 or len(block_lactate) == 0:
-        log.info("  [WARN] No lactate rows available; skipping lactate plots.")
-        log.info("=" * 60)
-        return
-
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    # Blocked lactate
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for status, color in SURV_COLORS.items():
-        subset = block_lactate[block_lactate["survival_status"] == status]
-        grouped = subset.groupby("block_start_hr")["mean_blood_lactate"].agg(["mean", "std", "count"])
-        if grouped.empty:
-            continue
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        mid = grouped.index + BS / 2
-        n = subset["hospitalization_id"].nunique()
-        ax.plot(mid, grouped["mean"], color=color, linewidth=2, marker="o", markersize=5, label=f"{status} (n={n:,})")
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.15)
-    ax.set_xlabel("Hours from First Vital")
-    ax.set_ylabel("Blood Lactate (mmol/L)")
-    ax.set_title(f"OHCA (ICU): Blood Lactate [{BS}h epochs, 0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_lactate_blocked_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_lactate_blocked_{WH}h.png")
-    plt.close()
-
-    # Epoch-smoothed lactate (mean per patient per epoch)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ld = raw_lactate.copy()
-    ld["epoch_start_hr"] = (np.floor(ld["hours_from_first_vital"] / BS) * BS).astype(int)
-    ld = ld[(ld["epoch_start_hr"] >= 0) & (ld["epoch_start_hr"] < WH)]
-    ld = (
-        ld.groupby(["hospitalization_id", "survival_status", "epoch_start_hr"], as_index=False)
-        .agg(epoch_lactate=("vital_value", "mean"))
-    )
-    for status, color in SURV_COLORS.items():
-        sub = ld[ld["survival_status"] == status]
-        grouped = sub.groupby("epoch_start_hr")["epoch_lactate"].agg(["mean", "std", "count"])
-        if grouped.empty:
-            continue
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        n = sub["hospitalization_id"].nunique()
-        mid = grouped.index + BS / 2
-        ax.plot(mid, grouped["mean"], color=color, linewidth=1.8, marker="o", markersize=4, label=f"{status} (n={n:,})")
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.15)
-    ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-    ax.set_ylabel("Blood Lactate (mmol/L)")
-    ax.set_title(f"OHCA (ICU): Blood Lactate — Epoch-Smoothed [0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_lactate_hourly_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_lactate_hourly_{WH}h.png")
-    plt.close()
-    log.info("=" * 60)
-
-
-# =============================================================
-# STEP 7d: HOURLY LACTATE TABLE BY TRAJECTORY × SURVIVAL
-# =============================================================
-def step7d_hourly_lactate_table(config, log, raw_lactate, traj_assignment):
-    WH = config["window_hours"]
-    BS = int(config.get("lactate_epoch_hours", 6))
-    out_dir = config["lactate_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 7d: {BS}-HOUR EPOCH LACTATE TABLE (0-{WH}h)")
-    log.info("=" * 60)
-
-    base_cols = [
-        "site",
-        "window_hours",
-        "epoch_hours",
-        "hour",
-        "trajectory",
-        "survival_status",
-        "mean_blood_lactate",
-        "sd_blood_lactate",
-        "se_blood_lactate",
-        "n_blood_lactate",
-    ]
-    if len(raw_lactate) == 0:
-        hourly_lactate = pd.DataFrame(columns=base_cols)
-        hourly_lactate.to_csv(out_dir / f"hourly_lactate_by_trajectory_survival_{WH}h.csv", index=False)
-        hourly_lactate.to_parquet(out_dir / f"hourly_lactate_by_trajectory_survival_{WH}h.parquet", index=False)
-        log.info("  [WARN] No lactate rows available; wrote empty hourly lactate table.")
-        log.info("=" * 60)
-        return hourly_lactate
-
-    rl = raw_lactate.copy()
-    rl["hour"] = (np.floor(rl["hours_from_first_vital"] / BS) * BS).astype(int)
-    rl = rl[(rl["hour"] >= 0) & (rl["hour"] < WH)]
-    rl = (
-        rl.groupby(["hospitalization_id", "hour"], as_index=False)
-        .agg(
-            survival_status=("survival_status", "first"),
-            vital_value=("vital_value", "mean"),
-        )
-    )
-    rl = rl.merge(traj_assignment[["hospitalization_id", "trajectory"]], on="hospitalization_id", how="inner")
-    rl["trajectory"] = rl["trajectory"].fillna("Unassigned")
-
-    hourly_lactate = (
-        rl.groupby(["hour", "trajectory", "survival_status"], as_index=False)
-        .agg(
-            mean_blood_lactate=("vital_value", "mean"),
-            sd_blood_lactate=("vital_value", "std"),
-            n_blood_lactate=("hospitalization_id", "nunique"),
-        )
-    )
-    hourly_lactate["se_blood_lactate"] = hourly_lactate["sd_blood_lactate"] / np.sqrt(hourly_lactate["n_blood_lactate"])
-    hourly_lactate = hourly_lactate.sort_values(["trajectory", "survival_status", "hour"]).reset_index(drop=True)
-    hourly_lactate.insert(0, "site", config["site_name"])
-    hourly_lactate.insert(1, "window_hours", WH)
-    hourly_lactate.insert(2, "epoch_hours", BS)
-
-    log.info(f"  Site label: {config['site_name']} (source: {config.get('site_name_source', 'unknown')})")
-    log.info(f"  Final: {len(hourly_lactate):,} rows, cols={list(hourly_lactate.columns)}")
-
-    hourly_lactate.to_csv(out_dir / f"hourly_lactate_by_trajectory_survival_{WH}h.csv", index=False)
-    hourly_lactate.to_parquet(out_dir / f"hourly_lactate_by_trajectory_survival_{WH}h.parquet", index=False)
-    log.info(f"  [OK] Saved hourly_lactate_{WH}h → lactate_upload_dir")
-    log.info("=" * 60)
-    return hourly_lactate
-
-
-# =============================================================
-# STEP 8c: LACTATE BY TRAJECTORY
-# =============================================================
-def step8c_lactate_trajectory_plots(config, log, raw_lactate, traj_assignment):
-    WH = config["window_hours"]
-    BS = int(config.get("lactate_epoch_hours", 6))
-    out_dir = config["lactate_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 8c: LACTATE BY TRAJECTORY (0-{WH}h)")
-    log.info("=" * 60)
-
-    if len(raw_lactate) == 0:
-        log.info("  [WARN] No lactate rows available; skipping trajectory lactate plot.")
-        log.info("=" * 60)
-        return pd.DataFrame()
-
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    lactate_by_traj = raw_lactate.merge(
-        traj_assignment[["hospitalization_id", "trajectory"]], on="hospitalization_id", how="inner"
-    )
-    lactate_by_traj["epoch_start_hr"] = (np.floor(lactate_by_traj["hours_from_first_vital"] / BS) * BS).astype(int)
-    lactate_by_traj = lactate_by_traj[(lactate_by_traj["epoch_start_hr"] >= 0) & (lactate_by_traj["epoch_start_hr"] < WH)]
-    lactate_by_traj = (
-        lactate_by_traj.groupby(
-            ["hospitalization_id", "trajectory", "survival_status", "epoch_start_hr"],
-            as_index=False,
-        )
-        .agg(vital_value=("vital_value", "mean"))
-    )
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for tn, color in TRAJ_COLORS.items():
-        sub = lactate_by_traj[lactate_by_traj["trajectory"] == tn]
-        if len(sub) == 0:
-            continue
-        grouped = sub.groupby("epoch_start_hr")["vital_value"].agg(["mean", "std", "count"])
-        grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-        n = sub["hospitalization_id"].nunique()
-        mid = grouped.index + BS / 2
-        ax.plot(mid, grouped["mean"], linewidth=1.7, color=color, marker="o", markersize=4, label=f"{tn} (n={n:,})")
-        ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.14)
-    ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-    ax.set_ylabel("Blood Lactate (mmol/L)")
-    ax.set_title(f"OHCA (ICU): Blood Lactate by Temperature Trajectory [{BS}h epochs, 0-{WH}h]")
-    ax.set_xlim(*bxlim)
-    ax.set_xticks(tick_pos)
-    ax.set_xticklabels(tick_labels, fontsize=8, rotation=45, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_lactate_by_trajectory_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_lactate_by_trajectory_{WH}h.png")
-    plt.close()
-    log.info("=" * 60)
-    return lactate_by_traj
-
-
-# =============================================================
-# STEP 9c: LACTATE TRAJECTORY × SURVIVAL PLOTS
-# =============================================================
-def step9c_lactate_traj_survival_plots(config, log, lactate_by_traj, cohort_ohca_icu):
-    WH = config["window_hours"]
-    BS = int(config.get("lactate_epoch_hours", 6))
-    out_dir = config["lactate_upload_dir"]
-    log.info("\n" + "=" * 60)
-    log.info(f"  STEP 9c: LACTATE TRAJECTORY × SURVIVAL PLOTS (0-{WH}h)")
-    log.info("=" * 60)
-
-    if lactate_by_traj is None or len(lactate_by_traj) == 0:
-        log.info("  [WARN] No lactate-by-trajectory rows available; skipping plots.")
-        log.info("=" * 60)
-        return
-
-    _, tick_pos, tick_labels, bxlim = _glucose_epoch_plot_params(WH, BS)
-
-    lactate_traj_surv = lactate_by_traj.copy()
-    if "survival_status" not in lactate_traj_surv.columns:
-        lactate_traj_surv = lactate_traj_surv.merge(
-            cohort_ohca_icu[["hospitalization_id", "survival_status"]].drop_duplicates(),
-            on="hospitalization_id",
-            how="left",
-        )
-    else:
-        surv_lookup = cohort_ohca_icu[["hospitalization_id", "survival_status"]].drop_duplicates()
-        surv_lookup = surv_lookup.set_index("hospitalization_id")["survival_status"]
-        missing = lactate_traj_surv["survival_status"].isna()
-        if missing.any():
-            lactate_traj_surv.loc[missing, "survival_status"] = lactate_traj_surv.loc[missing, "hospitalization_id"].map(surv_lookup)
-    lactate_traj_surv["survival_status"] = lactate_traj_surv["survival_status"].fillna("Unknown")
-
-    # Faceted by trajectory
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    for idx, tn in enumerate(TRAJ_ORDER):
-        ax = axes[idx // 2][idx % 2]
-        for status, color in SURV_COLORS.items():
-            sub = lactate_traj_surv[
-                (lactate_traj_surv["trajectory"] == tn) & (lactate_traj_surv["survival_status"] == status)
-            ]
-            if len(sub) == 0:
-                continue
-            grouped = sub.groupby("epoch_start_hr")["vital_value"].agg(["mean", "std", "count"])
-            grouped["se"] = grouped["std"] / np.sqrt(grouped["count"])
-            n = sub["hospitalization_id"].nunique()
-            mid = grouped.index + BS / 2
-            ax.plot(mid, grouped["mean"], linewidth=1.6, color=color, marker="o", markersize=4, label=f"{status} (n={n:,})")
-            ax.fill_between(mid, grouped["mean"] - 1.96 * grouped["se"], grouped["mean"] + 1.96 * grouped["se"], color=color, alpha=0.14)
-        ax.set_xlabel(f"Hours from First Vital ({BS}h epochs)")
-        ax.set_ylabel("Blood Lactate (mmol/L)")
-        ax.set_title(tn)
-        ax.set_xlim(*bxlim)
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    fig.suptitle(f"OHCA (ICU): Lactate by Trajectory and Survival [{BS}h epochs, 0-{WH}h]", fontsize=14, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_lactate_traj_survival_facet_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_lactate_traj_survival_facet_{WH}h.png")
-    plt.close()
-
-    # Final-epoch trajectory summary
-    fig, ax = plt.subplots(figsize=(10, 6))
-    final_epoch_start = (int(np.ceil(WH / BS)) - 1) * BS
-    end = lactate_traj_surv[lactate_traj_surv["epoch_start_hr"] == final_epoch_start].copy()
-    if end.empty and "epoch_start_hr" in lactate_traj_surv.columns:
-        final_epoch_start = int(lactate_traj_surv["epoch_start_hr"].max())
-        end = lactate_traj_surv[lactate_traj_surv["epoch_start_hr"] == final_epoch_start].copy()
-
-    xpos = np.arange(len(TRAJ_ORDER))
-    width = 0.36
-    for i, (status, color) in enumerate(SURV_COLORS.items()):
-        vals = []
-        for tn in TRAJ_ORDER:
-            s = end[(end["trajectory"] == tn) & (end["survival_status"] == status)]["vital_value"]
-            vals.append(float(s.mean()) if len(s) else np.nan)
-        ax.bar(xpos + (i - 0.5) * width, vals, width=width, color=color, alpha=0.9, label=status)
-    ax.set_xlabel("Temperature Trajectory")
-    ax.set_ylabel("Blood Lactate (mmol/L)")
-    ax.set_title(
-        f"OHCA (ICU): Blood Lactate at Final {BS}h Epoch ({final_epoch_start}-{min(final_epoch_start+BS, WH)}h)\n"
-        f"Survivor vs Non-Survivor by Trajectory"
-    )
-    ax.set_xticks(xpos)
-    ax.set_xticklabels(TRAJ_ORDER, rotation=15, ha="right")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / f"ohca_icu_lactate_survival_overall_{WH}h.png", dpi=150, bbox_inches="tight")
-    log.info(f"  [OK] ohca_icu_lactate_survival_overall_{WH}h.png")
-    plt.close()
-    log.info("=" * 60)
-
-
-# =============================================================
 # STEP 10: COHORT COMPARISON
 # =============================================================
 def step10_cohort_comparison(config, log, cohort_ohca_icu, cohort_v2):
@@ -2094,16 +1092,8 @@ def step11_table1(config, con, log, traj_assignment):
     table1 = table1.merge(traj_assignment[["hospitalization_id","trajectory"]], on="hospitalization_id", how="left")
     table1["trajectory"] = table1["trajectory"].fillna("No temp data")
 
-    # Ensure numeric columns are float-compatible for summary stats on sites with missing values.
-    for num_col in ["age", "los_days", "icu_los_days"]:
-        if num_col in table1.columns:
-            table1[num_col] = pd.to_numeric(table1[num_col], errors="coerce").astype(float)
-
     # Normalize case for cross-site consistency
-    table1["sex_category"] = table1["sex_category"].str.strip().str.title()
-    table1["race_category"] = table1["race_category"].str.strip().str.title()
-    table1["ethnicity_category"] = table1["ethnicity_category"].str.strip().str.title()
-    table1["discharge_category"] = table1.get("discharge_category", pd.Series(dtype=str)).str.strip().str.title()
+    normalize_categories(table1)
 
     log.info(f"  Rows: {len(table1):,}, Encounters: {table1['hospitalization_id'].nunique():,}")
 
@@ -2143,7 +1133,6 @@ def step11_table1(config, con, log, traj_assignment):
 def save_table1_outputs(config, log, table1):
     WH = config["window_hours"]
     site = config["site_name"]
-    log.info(f"  Site label: {site} (source: {config.get('site_name_source', 'unknown')})")
 
     n_surv = len(table1[table1["survival_status"]=="Survivor"])
     n_nonsurv = len(table1[table1["survival_status"]=="Non-Survivor"])

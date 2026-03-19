@@ -127,6 +127,52 @@ def alphabet_labels(n: int) -> list[str]:
     return labels
 
 
+def _site_name_from_source_path(source_path: str) -> str | None:
+    sp = str(source_path)
+    sp_l = sp.lower()
+    if "eicu_ohca_trajectories" in sp_l:
+        return "eICU"
+    m = re.search(r"/AHA-OHCA/([^/]+)/Upload_to_Box_without_oral_", sp, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"/([^/]+)/Upload_to_Box_without_oral_", sp)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def _normalize_site_name(raw_site: object, source_path: str) -> str:
+    raw = "" if pd.isna(raw_site) else str(raw_site).strip()
+    low = raw.lower()
+    if low in {"", "nan", "none", "unknown", "multisite"}:
+        inferred = _site_name_from_source_path(source_path)
+        if inferred:
+            raw = inferred
+            low = raw.lower()
+    if "eicu" in low:
+        return "eICU"
+    if "mimic" in low:
+        return "mimic"
+    return raw if raw else "Unknown"
+
+
+def build_site_display_labels(site_names: Iterable[str]) -> dict[str, str]:
+    names = list(site_names)
+    out: dict[str, str] = {}
+    for s in names:
+        sl = str(s).strip().lower()
+        if "mimic" in sl:
+            out[s] = "MIMIC-IV"
+        elif "eicu" in sl:
+            out[s] = "eICU"
+
+    others = [s for s in names if s not in out]
+    letters = alphabet_labels(len(others))
+    for s, lbl in zip(others, letters):
+        out[s] = lbl
+    return out
+
+
 def available_vitals(df: pd.DataFrame) -> list[str]:
     return [v for v in VITAL_ORDER if f"mean_{v}" in df.columns and f"n_{v}" in df.columns]
 
@@ -157,6 +203,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional CSV with columns: site,start_date,end_date for Figure 1 date-range labels.",
+    )
+    parser.add_argument(
+        "--extra-upload-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Optional additional root containing Upload_to_Box_without_oral_* folders "
+            "(e.g., an external site drop folder). Can be provided multiple times."
+        ),
     )
     return parser.parse_args()
 
@@ -219,9 +275,15 @@ def load_site_date_ranges(
     return out
 
 
-def load_data(base_dir: Path) -> LoadedData:
+def load_data(base_dir: Path, extra_upload_roots: Iterable[Path] | None = None) -> LoadedData:
     table_paths = _find_input_files(base_dir, "*/Upload_to_Box_without_oral_*/table1_poolable_*h.csv")
     hourly_paths = _find_input_files(base_dir, "*/Upload_to_Box_without_oral_*/hourly_vitals_by_trajectory_survival_*h.csv")
+    for root in (extra_upload_roots or []):
+        table_paths.extend(_find_input_files(root, "Upload_to_Box_without_oral_*/table1_poolable_*h.csv"))
+        hourly_paths.extend(_find_input_files(root, "Upload_to_Box_without_oral_*/hourly_vitals_by_trajectory_survival_*h.csv"))
+
+    table_paths = sorted({str(p): p for p in table_paths}.values(), key=lambda p: str(p))
+    hourly_paths = sorted({str(p): p for p in hourly_paths}.values(), key=lambda p: str(p))
     if not table_paths:
         raise FileNotFoundError(f"No table1_poolable files found in {base_dir}")
     if not hourly_paths:
@@ -241,8 +303,14 @@ def load_data(base_dir: Path) -> LoadedData:
         hourly_frames.append(df)
     hourly = pd.concat(hourly_frames, ignore_index=True)
 
-    table1["site"] = table1["site"].astype(str).str.strip()
-    hourly["site"] = hourly["site"].astype(str).str.strip()
+    table1["site"] = [
+        _normalize_site_name(s, sp)
+        for s, sp in zip(table1.get("site", pd.Series([""] * len(table1))), table1["source_path"])
+    ]
+    hourly["site"] = [
+        _normalize_site_name(s, sp)
+        for s, sp in zip(hourly.get("site", pd.Series([""] * len(hourly))), hourly["source_path"])
+    ]
     return LoadedData(table1=table1, hourly=hourly)
 
 
@@ -337,6 +405,8 @@ def figure1_feasibility(
     surv_p = surv_p.sort_values("n", ascending=False)
     surv_p["mortality_pct"] = surv_p["mortality_pct"].astype(float)
     surv_p["site"] = surv_p["site"].astype(str)
+    site_label_map = build_site_display_labels(surv_p["site"].tolist())
+    surv_p["site_label"] = surv_p["site"].map(site_label_map)
 
     traj = sub[(sub["group_type"] == "trajectory") & (sub["group"].isin(TRAJ_ORDER))]
     traj_p = _pivot_table1(traj[traj["variable"].isin(["n", "mortality_n", "mortality_pct"])], ["site", "group"])
@@ -389,7 +459,10 @@ def figure1_feasibility(
     x = np.arange(len(surv_p))
     ax2.bar(x, surv_p["n"], color="#90A4AE", alpha=0.9)
     ax2.set_xticks(x)
-    tick_labels = [f"{s}\n{dr}" for s, dr in zip(surv_p["site"], surv_p["case_date_range"])]
+    if (surv_p["case_date_range"] != "dates n/a").any():
+        tick_labels = [f"{s}\n{dr}" for s, dr in zip(surv_p["site_label"], surv_p["case_date_range"])]
+    else:
+        tick_labels = surv_p["site_label"].tolist()
     ax2.set_xticklabels(tick_labels, rotation=0, ha="center")
     ax2.set_ylabel("OHCA ICU N")
     ax2.set_title("B. Site Sample Size and Mortality")
@@ -414,8 +487,11 @@ def figure1_feasibility(
         .reindex(columns=TRAJ_ORDER, fill_value=0)
         .fillna(0)
     )
+    # Match Panel B site ordering.
+    comp = comp.reindex(index=surv_p["site"].tolist())
     comp_pct = comp.div(comp.sum(axis=1), axis=0) * 100
     sites = comp_pct.index.tolist()
+    site_labels = [site_label_map.get(s, s) for s in sites]
     xpos = np.arange(len(sites))
     bottom = np.zeros(len(sites))
     for g in TRAJ_ORDER:
@@ -423,7 +499,7 @@ def figure1_feasibility(
         ax3.bar(xpos, vals, bottom=bottom, color=TRAJ_COLORS[g], label=traj_label(g))
         bottom += vals
     ax3.set_xticks(xpos)
-    ax3.set_xticklabels(sites, rotation=20)
+    ax3.set_xticklabels(site_labels, rotation=20)
     ax3.set_ylabel("Trajectory Composition (%)")
     ax3.set_ylim(0, 100)
     ax3.set_title("C. Site Trajectory Composition")
@@ -436,7 +512,9 @@ def figure1_feasibility(
     plt.close(fig)
 
     surv_p.to_csv(output_dir / f"figure1_site_summary_{window_primary}h.csv", index=False)
-    comp_pct.reset_index().to_csv(output_dir / f"figure1_trajectory_composition_pct_{window_primary}h.csv", index=False)
+    comp_out = comp_pct.reset_index()
+    comp_out["site_label"] = comp_out["site"].map(site_label_map)
+    comp_out.to_csv(output_dir / f"figure1_trajectory_composition_pct_{window_primary}h.csv", index=False)
 
 
 def figure1b_single_panel_anonymized(
@@ -466,9 +544,8 @@ def figure1b_single_panel_anonymized(
         site_date_ranges_csv=site_date_ranges_csv,
     )
     surv_p["case_date_range"] = surv_p["site"].map(date_ranges).fillna("dates n/a")
-    surv_p["site_label"] = alphabet_labels(len(surv_p))
-    is_mimic = surv_p["site"].str.contains("mimic", case=False, na=False)
-    surv_p.loc[is_mimic, "site_label"] = "MIMIC"
+    site_label_map = build_site_display_labels(surv_p["site"].tolist())
+    surv_p["site_label"] = surv_p["site"].map(site_label_map)
     total_n = int(round(float(surv_p["n"].sum())))
 
     fig, ax = plt.subplots(figsize=(10.5, 6.3))
@@ -476,7 +553,7 @@ def figure1b_single_panel_anonymized(
     bars = ax.bar(x, surv_p["n"], color="#90A4AE", alpha=0.95)
     ax.set_xticks(x)
     ax.set_xticklabels(surv_p["site_label"])
-    xlabel = "Site (anonymized; MIMIC shown)"
+    xlabel = "Site (anonymized; MIMIC-IV and eICU shown)"
     ax.set_xlabel(xlabel)
     ax.set_ylabel("OHCA ICU N")
     ax.set_title(f"Figure 1B. Site Sample Size and Mortality ({window_primary}h)")
@@ -897,7 +974,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configure_tufte_style()
 
-    loaded = load_data(args.base_dir)
+    loaded = load_data(args.base_dir, extra_upload_roots=args.extra_upload_root)
     hourly_clean = clean_hourly(loaded.hourly)
 
     figure1_feasibility(
